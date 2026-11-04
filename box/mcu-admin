@@ -1,0 +1,1510 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# the mcu box's admin commands (mcu: multiple compute unit); run as root (the admin's sudo). Projects
+# then run themselves: they configure their repo, disk and volumes through
+# their own SSH key (mcu-job config / volume), inside the box's envelope.
+#
+#   mcu-admin init [--config]    install or update the box from this checkout
+#                                  (--config: replace /etc/mcu/box.toml by box.local.toml)
+#                                  (box.local.toml holds this machine's settings)
+#   mcu-admin config show          each setting in force and where it comes from
+#   mcu-admin doctor               what this machine has and lacks for mcu (read-only)
+#   mcu-admin uninstall [--purge [--yes]]
+#                                  services, code and system files off; the data stays,
+#                                  unless --purge (refused while jobs run)
+#   mcu-admin invite <project>   create the project if needed and print a new
+#                                  private key for it, its API key; replaces any
+#                                  previous key
+#   mcu-admin revoke <project>   remove the project's key; its data stays
+#   mcu-admin reclaim <project> [reason]
+#                                  free what the project can regenerate: images,
+#                                  build leftovers, storage tagged tmp, results
+#                                  older than 2 days
+#   mcu-admin purge <project> [--volumes] [reason]
+#                                  free everything but its identity (key, settings,
+#                                  Benchfiles): images, caches, src, all results;
+#                                  its volumes too with --volumes
+#                                  Both refuse while the project has jobs queued or
+#                                  running, and the project's agent is told
+#   mcu-admin prune              remove job results past their retention now
+#   mcu-admin passwd [--generate]  set the dashboard's admin password (stdin), or
+#                                  generate one and print it once
+#   mcu-admin queue open [--if-by <who>] | pause|close <reason> [--until <time>] [--by <who>]
+#                                  the queue's mode: paused accepts jobs but starts
+#                                  none; closed refuses new jobs (exit 75, with the
+#                                  reason) and starts none; running ones finish
+#   mcu-admin maintenance on <reason> | off
+#                                  the same as queue close | queue open
+#   mcu-admin migrate <project> [<unit>] <pool>
+#                                  move one unit (or all) of a project to a pool
+#   mcu-admin pool list | budget <mount|pool> <size> | add <name> <path> | default <name> | retire <name>
+#                                  the box's storage pools (mounted, prjquota)
+#   mcu-admin gpu eject | attach
+#                                  take the eGPU off the bus to unplug it (GPU jobs
+#                                  refused, running ones waited for), or bring it back
+#   mcu-admin task add <kind> [args...] | list | show <id> | cancel <id>
+#                                  long operations, run by mcu-task.service
+#   mcu-admin envelope [list] | set <key> <value> | reset <key>
+#                                  the limits any project may ask for (overrides box.toml)
+#   mcu-admin power fast|balanced|quiet
+#                                  the CPU's power profile (RAPL long-term limit)
+#   mcu-admin quota <project> [ssd|hdd] <size>|none
+#                                  the admin's own quota for a project, up to twice
+#                                  the envelope's max_disk_ssd (max_disk_hdd); sticks over its setting
+#   mcu-admin timing [cooldown on|off] [target auto|<C>] [cap <pct>|none] [max <s>]
+#                                  the profile of timing jobs (timing = true)
+#   mcu-admin list               the projects and their settings
+#   mcu-admin shutdown reboot|poweroff | cancel | status
+#                                  a graceful restart or power-off: queue closed,
+#                                  eGPU ejected, running jobs waited for, a 60 s
+#                                  countdown; cancellable until it ends
+#   mcu-admin status             the box at a glance, as JSON: queue, running and
+#                                  waiting jobs (memory reserved and used), GPU,
+#                                  machine, power profile, envelope
+#   mcu-admin orphans [--stop]   job containers still running after their job
+#                                  ended (a runner killed before it stopped them)
+#   mcu-admin cancel <project> <id>|--branch <branch>
+#                                  cancel a project's job, as the project would
+#
+# The dashboard (as mcu-web) may run, through sudo, only the subcommands its
+# sudoers rule lists (see init): invite, revoke, prune, maintenance, queue,
+# reclaim, purge, timing, quota, pool, migrate, envelope, task, power, shutdown,
+# cancel.
+
+set -euo pipefail
+
+# the real directory, also when called through /usr/local/bin/mcu-admin (a
+# link): its Python modules (mcuconf, hw) sit next to it
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+lib=/usr/local/lib/mcu
+state=/var/lib/mcu
+
+die() { echo "mcu-admin: $*" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || die "run as root"
+
+toml_get() {  # toml_get <file> <python expression on the parsed dict>
+  python3 -c "import sys, tomllib; d = tomllib.load(open(sys.argv[1], 'rb')); print($2)" "$1"
+}
+envelope_get() {  # envelope_get <key> [<unused>]: the envelope value in force (mcuconf)
+  python3 "$here/mcuconf.py" get "envelope.$1"
+}
+# pool_path [<project>]: the path of the project's pool (its settings), or of
+# the default pool; empty without pools (everything in the homes)
+pool_path() {
+  python3 - "${1:-}" <<'PY'
+import json, sys, tomllib
+from pathlib import Path
+st = Path("/var/lib/mcu")
+try:
+    data = json.load(open(st / "pools.json"))
+except (OSError, ValueError):
+    data = {}
+if not data.get("pools"):
+    d = tomllib.load(open("/etc/mcu/box.toml", "rb")).get("projects_dir")
+    data = {"pools": {"data": {"path": d}}, "default": "data"} if d else {"pools": {}}
+name = data.get("default")
+if sys.argv[1]:
+    try:
+        name = json.load(open(st / "projects" / f"{sys.argv[1]}.json")).get("pool") or name
+    except (OSError, ValueError):
+        pass
+print(data["pools"].get(name, {}).get("path", "") if name else "")
+PY
+}
+projects_dir() { pool_path "${1:-}"; }
+# make_tree <project>: the project's tree on the data filesystem, under an
+# XFS project quota (its uid) set to its disk; podman stores its images there
+make_tree() {
+  local p="$1" user="mcu-$1" pd uid home t
+  pd="$(projects_dir "$p")"; [ -n "$pd" ] || return 0
+  uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"; t="$pd/$p"
+  install -d -o "$user" -g "$user" -m 700 "$t" "$t/containers" "$t/cache" "$t/jobs" "$t/tmp"
+  # xfs_quota wants the filesystem's mount point, a pool may be a directory on it
+  # on a pool with project quotas, the tree gets the project's id; on the
+  # system's filesystem the user quota polices it instead
+  mnt="$(df --output=target "$pd" | tail -1)"
+  if xfs_quota -x -c "state -p" "$mnt" 2>/dev/null | grep -q "Enforcement: ON"; then
+    xfs_quota -x -c "project -s -p $t $uid" "$mnt" > /dev/null
+  fi
+  chcon -R -t container_file_t "$t"
+  # both levels the project's: install -d would make a missing ~/.config root's,
+  # and podman then refuses every build
+  install -d -o "$user" -g "$user" -m 700 "$home/.config" "$home/.config/containers"
+  printf '[storage]\ndriver = "overlay"\ngraphroot = "%s"\n' "$t/containers" > "$home/.config/containers/storage.conf"
+  chown "$user:$user" "$home/.config/containers/storage.conf"
+  disk="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('disk') or '')" "$state/projects/$p.json")"
+  [ -n "$disk" ] || disk="$(envelope_get default_disk 10g)"
+  SUDO_USER="$user" "$lib/mcu-helper" quota "$disk" > /dev/null
+}
+# pick_pool <project>: record the pool a new project goes to: the default
+# pool when it has room for its quota, else the pool with the most room left
+# after the quotas already promised there
+pick_pool() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+from pathlib import Path
+st = Path("/var/lib/mcu")
+p = sys.argv[1]
+try:
+    data = json.load(open(st / "pools.json"))
+except (OSError, ValueError):
+    data = {}
+pools = data.get("pools") or {}
+if not pools:
+    sys.exit(0)
+try:
+    usage = json.load(open(st / "usage.json"))
+except (OSError, ValueError):
+    usage = {}
+def room(name):
+    # the pool's budget (0: disabled) minus the quotas promised there, and
+    # never more than the filesystem's free space
+    try:
+        v = os.statvfs(pools[name]["path"])
+    except OSError:
+        return -1
+    free = v.f_bavail * v.f_frsize
+    budget = pools[name].get("budget", v.f_blocks * v.f_frsize)
+    if not budget:
+        return -1
+    promised = sum(u.get("quota", 0) for k, u in usage.items() if not k.startswith("_") and u.get("pool") == name)
+    return min(budget - promised, free)
+default = data.get("default")
+open_pools = [n for n in pools if room(n) > 0]
+if not open_pools:
+    sys.exit("mcu-admin: no pool has budget left for a new project (admin, Disk tab)")
+pick = default if default in open_pools and room(default) > 20 * 2**30 else max(open_pools, key=room)
+path = st / "projects" / f"{p}.json"
+conf = json.load(open(path))
+conf["pool"] = pick
+json.dump(conf, open(path, "w"), indent=1)
+PY
+}
+# convert_units <project>: a project tree from before units (the home's
+# cache one symlink to <pool>/<p>/cache) becomes one link per storage, so
+# each can move on its own
+convert_units() {
+  local p="$1" home user t e
+  user="mcu-$p"; home="$(getent passwd "$user" | cut -d: -f6)"
+  [ -L "$home/cache" ] || return 0
+  t="$(readlink "$home/cache")"
+  rm "$home/cache"
+  install -d -o "$user" -g "$user" -m 700 "$home/cache"
+  for e in "$t"/* "$t"/.git; do
+    [ -e "$e" ] || continue
+    ln -s "$e" "$home/cache/$(basename "$e")"
+    chown -h "$user:$user" "$home/cache/$(basename "$e")"
+  done
+  chcon -t container_file_t "$home/cache"
+}
+# hw_present <module>: the optional hardware is on this machine (box/hw)
+hw_present() {
+  python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import importlib; m = importlib.import_module('hw.' + sys.argv[2]); sys.exit(m.detect()[0] == 'absent')" "$here" "$1"
+}
+check_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{1,20}$ ]] && [ "$1" != web ] || die "bad project name"; }
+
+case "${1:-}" in
+  init)
+    # the machine's settings: box.local.toml the first time; afterwards
+    # /etc/mcu/box.toml is the machine's own (a checkout without one updates)
+    [ -f "$here/box.local.toml" ] || [ -f /etc/mcu/box.toml ] || die "no $here/box.local.toml (copy box.example.toml)"
+    groupadd -f mcu
+    install -d -m 2770 -g mcu "$state"
+    for f in sched.lock state.json events.jsonl; do
+      touch "$state/$f"
+      chgrp mcu "$state/$f" && chmod 660 "$state/$f"
+    done
+    install -d -m 755 "$state/projects" "$state/volumes" "$lib" /etc/mcu
+    install -d -m 755 "$state/keys"   # public key fingerprints, for the dashboard
+    # /etc/mcu/box.toml is the machine's own file once it exists (the admin,
+    # `envelope set` and the dashboard edit it): installed from box.local.toml
+    # the first time, or on `init --config`; otherwise only compared
+    if [ ! -f /etc/mcu/box.toml ] || [ "${2:-}" = --config ]; then
+      [ -f /etc/mcu/box.toml ] && cp -p /etc/mcu/box.toml "/etc/mcu/box.toml.bak.$(date +%Y%m%d-%H%M%S)"
+      install -m 644 "$here/box.local.toml" /etc/mcu/box.toml
+    elif [ -f "$here/box.local.toml" ] && ! cmp -s "$here/box.local.toml" /etc/mcu/box.toml; then
+      echo "mcu-admin: /etc/mcu/box.toml differs from $here/box.local.toml and is kept (init --config replaces it):" >&2
+      diff -u /etc/mcu/box.toml "$here/box.local.toml" | head -40 >&2 || true
+    fi
+    # an older box's queue flags (maintenance.json: closed, hold.json: paused
+    # or closed) become queue.json
+    python3 - "$state" <<'PY'
+import json, os, sys
+st = sys.argv[1]
+def read(name):
+    try:
+        return json.load(open(os.path.join(st, name)))
+    except (OSError, ValueError):
+        return None
+m, h = read("maintenance.json"), read("hold.json")
+if (m or h) and not os.path.exists(os.path.join(st, "queue.json")):
+    src = m or h
+    by = f"deploy:{src['pid']}" if src.get("by") == "deploy" and src.get("pid") else "root"
+    q = {"mode": "closed" if m else "paused", "reason": src.get("reason") or "set before an upgrade",
+         "since": src.get("since"), "until": src.get("until"), "by": by}
+    with open(os.path.join(st, "queue.json"), "w") as f:
+        json.dump(q, f)
+    os.chmod(os.path.join(st, "queue.json"), 0o644)
+    print(f"mcu-admin: queue flags turned into queue.json ({q['mode']})")
+for name in ("maintenance.json", "hold.json"):
+    if os.path.exists(os.path.join(st, name)):
+        os.unlink(os.path.join(st, name))
+PY
+    # an older box's dashboard values (envelope.json) move into box.toml
+    [ -e "$state/envelope.json" ] && "$0" envelope fold-legacy
+    # which Benchfile sets each project's quota (the dashboard shows it, and
+    # cannot read Benchfiles): noted at each upload, filled here for projects
+    # whose Benchfiles came before that (once; HOME: where mcu.py finds them)
+    for f in "$state"/projects/*.json; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f" .json)"
+      [ -d "/home/mcu-$p" ] || continue
+      grep -q '"disk_by_benchfile"' "$f" && continue
+      HOME="/home/mcu-$p" python3 - "$here" "$f" <<'PY' || echo "mcu-admin: $p: quota source not noted" >&2
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mcu
+conf = json.load(open(sys.argv[2]))
+mcu.note_disk_source(conf)
+with open(sys.argv[2], "r+") as fh:   # in place: the file keeps its owner
+    fh.write(json.dumps(conf, indent=1) + "\n")
+    fh.truncate()
+PY
+    done
+    # rootless podman can only pin a job to cores (--cpuset-cpus) when
+    # systemd delegates the cpuset controller to user sessions
+    install -d /etc/systemd/system/user@.service.d
+    printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
+      > /etc/systemd/system/user@.service.d/mcu-delegate.conf
+    # the files, from box/install.list (the same list as make install and
+    # mcuctl admin deploy); the dashboard comes built (npm run build, or a
+    # release): the box serves the files and runs no node
+    # (run from the installed copy, after make install, the files are there)
+    if [ -x "$here/install-files" ]; then
+      "$here/install-files" || die "the files could not be installed"
+    fi
+    rm -f "$lib/dashboard.py"
+    # what may run as root: projects only the helper (their quota and
+    # volumes); the dashboard only the subcommands listed below
+    cat > /etc/sudoers.d/mcu <<EOF
+%mcu,!mcu-web ALL=(root) NOPASSWD: $lib/mcu-helper
+mcu-web ALL=(root) NOPASSWD: $lib/mcu-admin invite *, $lib/mcu-admin revoke *, $lib/mcu-admin prune, $lib/mcu-admin maintenance *, $lib/mcu-admin queue *, $lib/mcu-admin reclaim *, $lib/mcu-admin purge *, $lib/mcu-admin timing *, $lib/mcu-admin quota *, $lib/mcu-admin pool *, $lib/mcu-admin migrate *, $lib/mcu-admin envelope *, $lib/mcu-admin task *, $lib/mcu-admin power *, $lib/mcu-admin shutdown *, $lib/mcu-admin cancel *
+EOF
+    chmod 440 /etc/sudoers.d/mcu
+    visudo -cqf /etc/sudoers.d/mcu || die "sudoers rule rejected"
+    install -d -m 755 /srv/mcu/volumes
+    if command -v nvidia-ctk > /dev/null; then
+      # jobs holding the gpu resource get the NVIDIA GPU through CDI; SELinux
+      # lets containers use the devices passed to them
+      nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml > /dev/null 2>&1
+      # the toolkit's own refresh fires many times while the driver loads at
+      # boot and hit its start limit (a failed unit at every boot)
+      install -d /etc/systemd/system/nvidia-cdi-refresh.path.d
+      printf '[Unit]\nStartLimitIntervalSec=0\n' > /etc/systemd/system/nvidia-cdi-refresh.path.d/mcu-start-limit.conf
+      setsebool -P container_use_devices 1
+    fi
+    semanage fcontext -a -t container_file_t '/srv/mcu/volumes(/.*)?' 2> /dev/null \
+      || semanage fcontext -m -t container_file_t '/srv/mcu/volumes(/.*)?'
+    restorecon -R /srv/mcu/volumes
+    # projects and volumes of the previous, admin-configured format
+    for f in /etc/mcu/projects/*.toml; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f" .toml)"
+      [ -f "$state/projects/$p.json" ] || python3 - "$f" "$state/projects/$p.json" <<'PY'
+import json, sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+json.dump({"repo": d.get("repo", ""), "manifest": d.get("manifest", "tools/bench/bench.toml")},
+          open(sys.argv[2], "w"), indent=1)
+PY
+      chown "mcu-$p:mcu" "$state/projects/$p.json" 2> /dev/null || true
+      rm -f "$f"
+    done
+    for f in /etc/mcu/volumes/*.toml; do
+      [ -f "$f" ] || continue
+      v="$(basename "$f" .toml)"
+      [ -f "$state/volumes/$v.json" ] || python3 - "$f" "$state/volumes/$v.json" <<'PY'
+import json, sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+json.dump({"owner": d["owner"], "readers": d.get("readers", []),
+           "keep_versions": d.get("keep_versions", 2)}, open(sys.argv[2], "w"), indent=1)
+PY
+      rm -f "$f"
+    done
+    rmdir /etc/mcu/projects /etc/mcu/volumes 2> /dev/null || true
+    # project trees from before units: one link per storage
+    for f in "$state"/projects/*.json; do
+      [ -f "$f" ] && getent passwd "mcu-$(basename "$f" .json)" > /dev/null && convert_units "$(basename "$f" .json)"
+    done
+    # a ~/.config an older invite left to root: the project's again
+    for f in "$state"/projects/*.json; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f" .json)"
+      h="$(getent passwd "mcu-$p" | cut -d: -f6)" || continue
+      if [ -d "$h/.config" ] && [ ! -L "$h/.config" ] && [ "$(stat -c %u "$h/.config")" = 0 ]; then
+        chown "mcu-$p:mcu-$p" "$h/.config" && chmod 700 "$h/.config"
+        echo "mcu-admin: $h/.config given back to mcu-$p"
+      fi
+    done
+    # fingerprints of keys installed before invite existed, for the dashboard
+    for f in "$state"/projects/*.json; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f" .json)"
+      ak="$(getent passwd "mcu-$p" | cut -d: -f6)/.ssh/authorized_keys"
+      [ -s "$ak" ] && [ ! -f "$state/keys/$p.fingerprint" ] \
+        && sed 's/^[^ ]* //' "$ak" | ssh-keygen -lf - | awk '{print $2}' | head -1 > "$state/keys/$p.fingerprint"
+    done
+    # the dashboard: an API and its single page app, all behind a password, TLS
+    id mcu-web > /dev/null 2>&1 || useradd -r -M -s /sbin/nologin -G mcu mcu-web
+    # the dashboard's sessions, kept across its restarts (token hashes only)
+    install -d -o mcu-web -g mcu-web -m 700 /var/lib/mcu-web
+    if [ ! -f /etc/mcu/dashboard.pem ]; then
+      # ECDSA P-256: browsers do not take Ed25519 certificates (Firefox:
+      # SSL_ERROR_NO_CYPHER_OVERLAP)
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 -subj "/CN=$(hostname)" \
+        -addext "subjectAltName=DNS:$(hostname)" \
+        -keyout /etc/mcu/dashboard.key -out /etc/mcu/dashboard.pem 2> /dev/null
+      chgrp mcu-web /etc/mcu/dashboard.key && chmod 640 /etc/mcu/dashboard.key
+    fi
+    port="$(python3 "$here/mcuconf.py" get dashboard_port)"
+    cat > /etc/systemd/system/mcu-dashboard.service <<EOF
+[Unit]
+Description=mcu box dashboard
+After=network-online.target
+
+[Service]
+User=mcu-web
+# its own group reads the TLS key and admin.json; mcu reads the state
+Group=mcu-web
+SupplementaryGroups=mcu
+ExecStart=/usr/bin/python3 $lib/api.py --port $port
+Restart=on-failure
+# no ProtectSystem/ProtectHome: the admin page's sudo mcu-admin invite
+# inherits this mount view, and it creates users and their homes. The
+# limits are the unprivileged user and the narrow sudoers rule.
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    # time series: rrdtool databases written by mcu-web
+    command -v rrdtool > /dev/null || dnf -y -q install rrdtool > /dev/null
+    # the eGPU's rule and the NVIDIA driver options: only with an NVIDIA GPU,
+    # found or declared ([resources] gpu); otherwise none of it (the block
+    # below keeps its indentation: its heredocs are written as they are)
+    if hw_present nvidia || python3 "$here/mcuconf.py" get resources | grep -q gpu; then
+    # the eGPU: its plug and unplug handled at once, as root through
+    # systemd-run so udev never waits: mcu-helper gpu-event clears an eject
+    # when the driver takes the card back, marks a pull without eject, and
+    # reloads the driver when the enclosure comes back after one; then the
+    # collector's GPU pass tells the dashboard and the scheduler
+    cat > /etc/udev/rules.d/90-mcu-egpu.rules <<EOF
+# mcu: the NVIDIA eGPU's driver binds or goes, its Thunderbolt enclosure comes
+# or goes (installed by mcu-admin init)
+ACTION=="bind|unbind|remove", SUBSYSTEM=="pci", ENV{PCI_ID}=="10DE:*", ENV{PCI_CLASS}=="30000|30200", \\
+    RUN+="/usr/bin/systemd-run --no-block --quiet --collect /usr/bin/python3 $lib/mcu-helper gpu-event \$env{ACTION}"
+ACTION=="add|remove", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_device", \\
+    RUN+="/usr/bin/systemd-run --no-block --quiet --collect /usr/bin/python3 $lib/mcu-helper gpu-event thunderbolt-\$env{ACTION}"
+# the host's Thunderbolt controller stays awake: on this Intel TB3 NUC, once
+# runtime-suspended after an unplug it failed every resume (tb_domain_runtime_resume,
+# "failed to send driver ready to ICM") and never saw the enclosure come back
+ACTION=="add|bind", SUBSYSTEM=="pci", DRIVER=="thunderbolt", ATTR{power/control}="on"
+EOF
+    for nhi in /sys/bus/pci/drivers/thunderbolt/0000:*; do
+      [ -e "$nhi/power/control" ] && echo on > "$nhi/power/control"
+    done
+    # at power-off, let go of the eGPU before the Thunderbolt stack is torn
+    # down (after amd-usb4-egpu-toolkit's shutdown helper): a hung power-off
+    # otherwise
+    cat > /etc/systemd/system/mcu-egpu-shutdown.service <<EOF
+[Unit]
+Description=mcu: let go of the NVIDIA eGPU before power-off
+DefaultDependencies=no
+After=multi-user.target
+Before=shutdown.target final.target
+Conflicts=reboot.target poweroff.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/bin/python3 $lib/mcu-helper gpu-shutdown
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now mcu-egpu-shutdown.service > /dev/null 2>&1
+    # a power-off or reboot that hangs (the eGPU's driver or the
+    # Wi-Fi stuck in the kernel) ends in a reset by the hardware watchdog
+    # after 5 min, rather than waiting for someone at the power button
+    install -d /etc/systemd/system.conf.d
+    cat > /etc/systemd/system.conf.d/mcu-reboot-watchdog.conf <<EOF
+# mcu (mcu-admin init): the hardware watchdog resets a hung power-off or reboot
+[Manager]
+RebootWatchdogSec=5min
+EOF
+    systemctl daemon-reload
+    # no console on the card (fbdev off: nothing holds it at a removal), but
+    # modeset on: NVIDIA's GBM backend needs it, and every compositor of a
+    # display = "gpu" job goes through GBM; applies when the driver next
+    # loads (a reboot, or a reload after a pull)
+    cat > /etc/modprobe.d/mcu-nvidia-headless.conf <<EOF
+# mcu (mcu-admin init): no console on the eGPU; modeset for GBM (display = "gpu")
+options nvidia-drm modeset=1 fbdev=0
+# nouveau must never take the card: the kernel command line's blacklist did
+# not stop it when the card came back during a driver reload
+blacklist nouveau
+install nouveau /bin/false
+EOF
+    else
+      rm -f /etc/udev/rules.d/90-mcu-egpu.rules /etc/modprobe.d/mcu-nvidia-headless.conf
+    fi
+    if hw_present rapl; then
+    # the power graph: the RAPL energy counters are root-only (an
+    # energy side channel); the collector's group may read them, projects not
+    cat > /etc/udev/rules.d/91-mcu-rapl.rules <<EOF
+# mcu: the collector (group mcu-web) reads the RAPL energy counters for the
+# power graph; other users still can't (installed by mcu-admin init)
+ACTION=="add", SUBSYSTEM=="powercap", TEST=="energy_uj", \\
+    RUN+="/usr/bin/chgrp mcu-web /sys%p/energy_uj", RUN+="/usr/bin/chmod 0440 /sys%p/energy_uj"
+EOF
+    udevadm control --reload
+    udevadm trigger --action=add --subsystem-match=powercap
+    else
+      rm -f /etc/udev/rules.d/91-mcu-rapl.rules
+      udevadm control --reload
+    fi
+    # the CPU's power profile comes back at boot (the firmware's value otherwise)
+    cat > /etc/systemd/system/mcu-power.service <<EOF
+[Unit]
+Description=mcu: the CPU power profile chosen in the dashboard
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $lib/mcu-helper power-restore
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable mcu-power.service > /dev/null 2>&1
+    # the admin task worker: long operations queued by the dashboard
+    install -d -m 755 "$state/tasks"
+    cat > /etc/systemd/system/mcu-task.service <<EOF
+[Unit]
+Description=mcu box admin task worker (migrate, purge, reclaim, prune)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/bin/python3 $lib/mcu-task worker
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install -d -o mcu-web -g mcu -m 755 "$state/rrd"
+    for unit in prune usage collect; do
+      user=root
+      case $unit in
+        prune) cmd="/usr/bin/python3 $lib/mcu.py prune"; when="OnCalendar=daily" ;;
+        usage) cmd="/usr/bin/python3 $lib/mcu-helper usage --parts"; when="OnCalendar=*:0/5" ;;
+        collect) cmd="/usr/bin/python3 $lib/collect.py"; when="OnCalendar=*:*:00"; user=mcu-web ;;
+      esac
+      printf '[Unit]\nDescription=mcu %s\n\n[Service]\nType=oneshot\nUser=%s\nExecStart=%s\n' "$unit" "$user" "$cmd" \
+        > "/etc/systemd/system/mcu-$unit.service"
+      printf '[Unit]\nDescription=mcu %s timer\n\n[Timer]\n%s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' \
+        "$unit" "$when" > "/etc/systemd/system/mcu-$unit.timer"
+    done
+    # at boot, before anyone can submit: jobs the restart killed get a status
+    # (exit 75, interrupted), so wait and status never hang on them
+    cat > /etc/systemd/system/mcu-recover.service <<EOF
+[Unit]
+Description=mcu box: close the jobs a restart interrupted
+After=local-fs.target
+Before=sshd.service mcu-dashboard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $lib/mcu.py recover
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    firewall-cmd -q --permanent --add-port="$port/tcp" && firewall-cmd -q --reload
+    systemctl daemon-reload
+    systemctl enable --now mcu-prune.timer mcu-usage.timer mcu-collect.timer > /dev/null 2>&1
+    systemctl enable mcu-dashboard.service mcu-recover.service > /dev/null 2>&1
+    systemctl enable mcu-task.service > /dev/null 2>&1; systemctl restart mcu-task.service
+    systemctl restart mcu-dashboard.service
+    systemctl start mcu-usage.service
+    echo "mcu-admin: initialized (dashboard on https port $port)"
+    ;;
+  invite)
+    [ $# -eq 2 ] || die "usage: invite <project>"
+    p="$2" user="mcu-$2"
+    check_name "$p"
+    id "$user" > /dev/null 2>&1 || useradd -m -G mcu -c "mcu jobs of $p" "$user"
+    loginctl enable-linger "$user"
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    install -d -o "$user" -g "$user" -m 700 "$home/.ssh"
+    for dir in src cache jobs; do
+      install -d -o "$user" -g "$user" -m 700 "$home/$dir"
+    done
+    # labeled once for containers, so jobs mount them without relabeling the
+    # whole tree each time (new files inherit the label)
+    chcon -R -t container_file_t "$home/src" "$home/cache" "$home/jobs"
+    new_project=0; [ -f "$state/projects/$p.json" ] || new_project=1
+    if [ ! -f "$state/projects/$p.json" ]; then
+      printf '{\n "repo": "",\n "manifest": "tools/bench/bench.toml"\n}\n' > "$state/projects/$p.json"
+    fi
+    chown "$user:mcu" "$state/projects/$p.json" && chmod 644 "$state/projects/$p.json"
+    # the project's own quota if it set one, else the envelope's default,
+    # which it then follows (not copied: a later default reaches it)
+    disk="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('disk') or '')" "$state/projects/$p.json")"
+    [ -n "$disk" ] || disk="$(envelope_get default_disk 10g)"
+    kb=$(python3 -c "import re,sys; m=re.fullmatch(r'(\d+(?:\.\d+)?)([kmgtKMGT]?)', sys.argv[1]); print(int(float(m.group(1))*{'':1,'k':2**10,'m':2**20,'g':2**30,'t':2**40}[m.group(2).lower()])//1024)" "$disk")
+    xfs_quota -x -c "limit -u bsoft=${kb}k bhard=${kb}k $user" /
+    # with a data filesystem, a new project lives there from the start
+    if [ $new_project = 1 ] && [ -n "$(projects_dir)" ]; then
+      # the default pool, or the one with the most room not yet promised
+      pick_pool "$p"
+      make_tree "$p"
+      for d in cache jobs; do rmdir "$home/$d" && ln -s "$(projects_dir "$p")/$p/$d" "$home/$d" && chown -h "$user:$user" "$home/$d"; done
+      convert_units "$p"
+    fi
+    # a new key pair: the public half reaches mcu.py only (no shell, no
+    # forwarding; a pty for debug), the private half is the project's API key
+    tmp="$(mktemp -d)"
+    # the key says how to use it (its comment: ssh-keygen -l -f <key>), so a
+    # key handed over alone is enough to start
+    ssh-keygen -q -t ed25519 -N '' -C "$user@$(hostname) start: ssh -i <this key> -o IdentitiesOnly=yes $user@$(hostname) docs agents" -f "$tmp/key"
+    printf 'restrict,pty,command="/usr/local/bin/mcu-job" %s\n' "$(cat "$tmp/key.pub")" \
+      > "$home/.ssh/authorized_keys"
+    chown "$user:$user" "$home/.ssh/authorized_keys" && chmod 600 "$home/.ssh/authorized_keys"
+    ssh-keygen -lf "$tmp/key.pub" | awk '{print $2}' > "$state/keys/$p.fingerprint"
+    cat "$tmp/key"
+    rm -rf "$tmp"
+    echo "mcu-admin: invited $p ($user@$(hostname), disk $disk); it starts with: ssh -i <key> -o IdentitiesOnly=yes $user@$(hostname) docs agents" >&2
+    ;;
+  task)
+    # task add <kind> [args...] | list | show <id> | cancel <id>: the queue of
+    # long admin operations (mcu-task.service runs them)
+    shift
+    exec /usr/bin/python3 "$lib/mcu-task" "$@"
+    ;;
+  envelope)
+    # envelope [list] | set <key> <value> | reset <key>: the limits any project
+    # may ask for, in /etc/mcu/box.toml's [envelope], the only place they live:
+    # a change rewrites that key's line (comments kept, a dated backup, the
+    # diff in the event log); reset brings the default back (an explained line
+    # stays, commented out, as the example a later set returns to)
+    shift
+    python3 - "$state" "$here" "$@" <<'PY'
+import fcntl, json, os, re, sys, time, tomllib
+st, here, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+etc = "/etc/mcu/box.toml"
+file = tomllib.load(open(etc, "rb"))
+base = file.get("envelope", {})
+declared = sorted((file.get("resources") or {"render": 1, "gpu": 1}).keys())
+threads = os.cpu_count()
+SIZE = r"\d+(\.\d+)?[kmgt]"
+sys.path.insert(0, here)
+import mcuconf  # the bounds, from this machine: the same the dashboard draws; the writer
+def check(k, v):
+    value = check_form(k, v)
+    why = mcuconf.in_bounds(k, value)
+    if why:
+        raise ValueError(why)
+    return value
+def check_form(k, v):
+    if k in ("default_disk", "max_disk", "max_disk_ssd", "memory"):
+        if not re.fullmatch(SIZE, v.lower()): raise ValueError("a size like 40g")
+        return v.lower()
+    if k == "jobs_memory":
+        if not re.fullmatch(SIZE, v.lower()): raise ValueError("a size like 12g")
+        total = int(next(l for l in open("/proc/meminfo") if l.startswith("MemTotal:")).split()[1]) * 1024
+        n = float(v[:-1]) * {"k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[v[-1].lower()]
+        if not min(4 * 2**30, total - 2**30) <= n <= total - 2**30:
+            raise ValueError(f"between 4g and {(total - 2**30) / 2**30:.0f}g (1 GB stays for the system)")
+        return v.lower()
+    if k == "max_disk_hdd":
+        if not re.fullmatch(SIZE + "|0", v.lower()): raise ValueError("a size like 300g, or 0")
+        return v.lower()
+    if k in ("max_cores", "build_cores"):
+        n = int(v)
+        if not 1 <= n <= threads: raise ValueError(f"between 1 and {threads}")
+        return n
+    if k in ("max_jobs", "max_volumes", "retention_days"):
+        n = int(v)
+        if n < 1: raise ValueError("at least 1")
+        return n
+    if k == "timeout_max":
+        if not re.fullmatch(r"\d+[smh]?", v): raise ValueError("a duration like 3h")
+        return v
+    if k == "network":
+        if v not in ("none", "fetch", "full"): raise ValueError("none, fetch or full")
+        return v
+    if k == "exclusive":
+        items = [x for x in v.split(",") if x]
+        bad = [x for x in items if x not in ["machine", "disk"] + declared]
+        if bad: raise ValueError(f"unknown {', '.join(bad)}")
+        return items
+    if k == "resources":
+        items = [x for x in v.split(",") if x]
+        bad = [x for x in items if x not in declared]
+        if bad: raise ValueError(f"not declared by the box: {', '.join(bad)}")
+        return items
+    raise ValueError("not an envelope key")
+def apply(changes, what):
+    try:
+        new = mcuconf.edit_envelope(open(etc).read(), changes)
+    except ValueError as e:
+        sys.exit(f"mcu-admin: {e}; nothing written")
+    diff, bak = mcuconf.write_box(new, etc)
+    if diff:
+        with open(os.path.join(st, "events.jsonl"), "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps({"kind": "config", "what": what, "changes": changes, "file": etc, "diff": diff,
+                                "backup": str(bak) if bak else None, "by": os.environ.get("SUDO_USER") or "root",
+                                "t": time.time()}) + "\n")
+    return diff
+def requota(key):
+    # the projects on the default quota follow it (they never set their own)
+    if key == "default_disk" and os.path.exists("/usr/local/lib/mcu/mcu-helper"):
+        import subprocess
+        subprocess.run(["/usr/bin/python3", "/usr/local/lib/mcu/mcu-helper", "requota"])
+if args[:1] == ["set"] and len(args) == 3:
+    try:
+        value = check(args[1], args[2])
+    except ValueError as e:
+        sys.exit(f"mcu-admin: {args[1]}: {e}")
+    apply({args[1]: value}, f"envelope {args[1]}")
+    print(f"mcu-admin: envelope {args[1]} = {value} (in {etc}; was {base.get(args[1], 'the default')})")
+    requota(args[1])
+elif args[:1] == ["reset"] and len(args) == 2:
+    if args[1] not in base:
+        sys.exit(f"mcu-admin: {args[1]} is not set in {etc}; it already has its default")
+    apply({args[1]: None}, f"envelope {args[1]}")
+    print(f"mcu-admin: envelope {args[1]} back to its default ({mcuconf.load()['envelope'].get(args[1])}); its line in {etc} commented out or removed")
+    requota(args[1])
+elif args == ["fold-legacy"]:
+    # init: the values an older box kept in envelope.json go into box.toml
+    legacy = os.path.join(st, "envelope.json")
+    try:
+        over = json.load(open(legacy))
+    except (OSError, ValueError):
+        over = None
+    if over:
+        print(apply(over, "envelope.json folded into box.toml"), end="")
+        print(f"mcu-admin: {len(over)} value(s) from {legacy} written into {etc}")
+    if over is not None:
+        os.unlink(legacy)
+elif args in ([], ["list"]):
+    conf, origins = mcuconf.load(with_origins=True)
+    for k in sorted(conf["envelope"]):
+        print(f"{k:<16} {conf['envelope'][k]!s:<24} {origins.get('envelope.' + k, 'box.toml')}")
+else:
+    sys.exit("mcu-admin: usage: envelope [list] | set <key> <value> | reset <key>")
+PY
+    ;;
+  shutdown)
+    # shutdown reboot|poweroff | cancel | status: the graceful restart or
+    # power-off, as a task (queue closed, eGPU ejected, running jobs waited
+    # for, a 60 s countdown), cancellable until the end of the countdown
+    case "${2:-}" in
+      reboot|poweroff|test) exec "$lib/mcu-task" add shutdown --run "$2" ;;
+      --run) [ $# -eq 3 ] || die "usage: shutdown --run reboot|poweroff"
+             exec /usr/bin/python3 "$lib/mcu-helper" shutdown-run "$3" ;;
+      cancel)
+        id=$(python3 - <<'PY'
+import json, pathlib
+for p in sorted(pathlib.Path("/var/lib/mcu/tasks").glob("*.json")):
+    t = json.loads(p.read_text())
+    if t["kind"] == "shutdown" and t["state"] in ("queued", "waiting", "running"):
+        print(t["id"])
+PY
+)
+        [ -n "$id" ] || die "no restart or power-off in progress"
+        exec "$lib/mcu-task" cancel "$id" ;;
+      status) cat "$state/shutdown.json" 2>/dev/null || echo "no restart or power-off in progress" ;;
+      *) die "usage: shutdown reboot|poweroff|test | cancel | status" ;;
+    esac
+    ;;
+  status)
+    # status: the box at a glance, as JSON (mcuctl status shows it)
+    exec python3 - "$lib" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import mcu
+out = mcu.health(None)
+out["power"] = mcu.read_state_json("power.json") or None
+out["envelope"] = mcu.envelope_summary()
+print(json.dumps(out, indent=1, default=str))
+PY
+    ;;
+  orphans)
+    # orphans [--stop]: containers of jobs that already ended
+    [ $# -le 2 ] && [ "${2:---stop}" = --stop ] || die "usage: orphans [--stop]"
+    for home in /home/mcu-*; do
+      user=${home##*/}
+      [ -d "$home/jobs" ] || continue
+      sudo -u "$user" bash -c 'cd /tmp; podman ps --format "{{.ID}} {{index .Labels \"mcu.job\"}} {{.RunningFor}}"' 2>/dev/null |
+      while read -r cid job since; do
+        if [ -z "$job" ] || [ "$job" = "<no" ]; then
+          echo "$user $cid: no job label (a job from before the labels), running $since"
+        elif [ -e "$home/jobs/$job/status" ]; then
+          echo "$user $cid: job $job ended, still running ($since)"
+          [ "${2:-}" = --stop ] && sudo -u "$user" bash -c "cd /tmp; podman stop -t 10 $cid" > /dev/null && echo "  stopped"
+        fi
+      done
+    done
+    ;;
+  cancel)
+    # cancel <project> <id> | cancel <project> --branch <b>: as the project would
+    [ $# -ge 3 ] || die "usage: cancel <project> <id> | cancel <project> --branch <branch>"
+    check_name "$2"
+    [ -f "$state/projects/$2.json" ] || die "no project $2"
+    cd /tmp
+    exec sudo -u "mcu-$2" env SSH_ORIGINAL_COMMAND="cancel ${*:3}" python3 "$lib/mcu.py"
+    ;;
+  power)
+    # power fast|balanced|quiet: the CPU's power profile (RAPL's long-term
+    # limit), now and at every boot; timing jobs run at fast
+    [ $# -eq 2 ] || die "usage: power fast|balanced|quiet"
+    exec "$lib/mcu-helper" power "$2"
+    ;;
+  quota)
+    # quota <project> [ssd|hdd] <size>|none: the admin's sticky quota for a
+    # project on a pool type (ssd when not given)
+    [ $# -eq 3 ] || { [ $# -eq 4 ] && { [ "$3" = ssd ] || [ "$3" = hdd ]; }; } || die "usage: quota <project> [ssd|hdd] <size>|none"
+    check_name "$2"
+    if [ $# -eq 4 ]; then "$lib/mcu-helper" admin-quota "$2" "$3" "$4"; else "$lib/mcu-helper" admin-quota "$2" "$3"; fi
+    ;;
+  timing)
+    # timing [cooldown on|off] [target auto|<°C>] [cap <pct>|none] [max <s>]:
+    # the profile timing jobs (timing = true) get; with no argument, shows it
+    shift
+    python3 - "$state/timing.json" "$@" <<'PY'
+import json, os, sys
+path, args = sys.argv[1], sys.argv[2:]
+try:
+    t = json.load(open(path))
+except (OSError, ValueError):
+    t = {}
+if len(args) % 2:
+    sys.exit("mcu-admin: usage: timing [cooldown on|off] [target auto|<C>] [cap <pct>|none] [max <s>]")
+for k, v in zip(args[::2], args[1::2]):
+    if k == "cooldown" and v in ("on", "off"):
+        t["cooldown"] = v == "on"
+    elif k == "target" and (v == "auto" or v.replace(".", "", 1).isdigit()):
+        t["target"] = "auto" if v == "auto" else float(v)
+    elif k == "cap" and (v == "none" or (v.isdigit() and 30 <= int(v) <= 100)):
+        t["cap_pct"] = None if v == "none" else int(v)
+    elif k == "max" and v.isdigit():
+        t["cooldown_max"] = int(v)
+    else:
+        sys.exit(f"mcu-admin: bad timing setting {k} {v}")
+if args:
+    tmp = path + ".tmp"
+    json.dump(t, open(tmp, "w"), indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+show = {k: t.get(k, d) for k, d in (("cooldown", False), ("target", "auto"), ("cap_pct", None), ("cooldown_max", 600))}
+try:
+    idle = json.load(open(os.path.join(os.path.dirname(path), "idle.json"))).get("idle_temp")
+except (OSError, ValueError):
+    idle = None
+print("mcu-admin: timing", json.dumps(show), f"(idle {idle} °C, measured)")
+PY
+    ;;
+  gpu)
+    # gpu eject | attach: the eGPU off the bus to unplug it, or back on it
+    case "${2:-}" in
+      eject) exec "$lib/mcu-helper" gpu-eject ;;
+      attach) exec "$lib/mcu-helper" gpu-attach ;;
+      *) die "usage: gpu eject | attach" ;;
+    esac
+    ;;
+  migrate)
+    # migrate <project> <unit> <pool>: move one unit (storage/<name>, images,
+    # results, volume/<name>) to a pool; new jobs using it wait, running ones
+    # are waited for;
+    # migrate <project> <pool>: move all its units there, one by one
+    [ $# -eq 3 ] || [ $# -eq 4 ] || die "usage: migrate <project> [<unit>] <pool>"
+    p="$2"; check_name "$p"
+    getent passwd "mcu-$p" > /dev/null || die "no project $p"
+    convert_units "$p"
+    if [ $# -eq 4 ]; then
+      exec "$lib/mcu-helper" move-unit "$p" "$3" "$4"
+    fi
+    pool="$3"
+    units="$("$lib/mcu-helper" units "$p" | python3 -c "
+import json, sys
+for u in json.load(sys.stdin):
+    print(u['unit'])")"
+    n=$(echo "$units" | grep -c .); k=0
+    for u in $units; do
+      k=$((k + 1))
+      echo "progress: step $k/$n $u"
+      "$lib/mcu-helper" move-unit "$p" "$u" "$pool" 2>&1 | grep -v "is already on" || true
+    done
+    python3 - "$state" "$p" "$pool" <<'PY'
+import json, sys
+st, p, pool = sys.argv[1:4]
+path = f"{st}/projects/{p}.json"
+conf = json.load(open(path)); conf["pool"] = pool; json.dump(conf, open(path, "w"), indent=1)
+PY
+    "$lib/mcu-helper" usage > /dev/null 2>&1 || true
+    echo "mcu-admin: $p's units are on $pool, its default pool for new units"
+    ;;
+  pool)
+    # pool list | add <name> <path> | default <name> | retire <name>
+    shift
+    python3 - "$state" "$lib/mcu-helper" "$@" <<'PY'
+import json, os, re, subprocess, sys, tomllib
+st, helper, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+path = os.path.join(st, "pools.json")
+try:
+    data = json.load(open(path))
+except (OSError, ValueError):
+    data = {}
+if not data.get("pools"):
+    d = tomllib.load(open("/etc/mcu/box.toml", "rb")).get("projects_dir")
+    data = {"pools": {"data": {"path": d}}, "default": "data"} if d else {"pools": {}, "default": None}
+def save():
+    tmp = path + ".tmp"; json.dump(data, open(tmp, "w"), indent=1); os.chmod(tmp, 0o644); os.replace(tmp, path)
+def users_of(name):
+    out = []
+    for f in os.listdir(os.path.join(st, "projects")):
+        if f.endswith(".json"):
+            c = json.load(open(os.path.join(st, "projects", f)))
+            here = c.get("pool") or data.get("default")
+            tree = os.path.join(data["pools"][name]["path"], f[:-5])
+            if here == name and os.path.isdir(tree):
+                out.append(f[:-5])
+    return out
+def check(p):
+    # the helper's checks: mounted, its own filesystem, project quotas enforced
+    r = subprocess.run([helper, "pool-check", p], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"ok": False, "error": (r.stderr or "check failed").strip()[-200:]}
+cmd = args[:1]
+if cmd == ["list"] or not args:
+    for n, spec in data["pools"].items():
+        c = check(spec["path"])
+        print(f"{n}{' (default)' if n == data.get('default') else ''}: {spec['path']} "
+              + (f"{c.get('free', 0) / 2**30:.0f} GB free of {c.get('size', 0) / 2**30:.0f}" if c.get("size") else "")
+              + ("" if c["ok"] else f" -- {c.get('error')}") + f"; projects: {' '.join(users_of(n)) or '-'}")
+elif cmd == ["add"] and len(args) == 3:
+    name, p = args[1], os.path.realpath(args[2])
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,20}", name) or name in data["pools"]:
+        sys.exit("mcu-admin: bad or taken pool name")
+    if any(os.path.realpath(s["path"]) == p for s in data["pools"].values()):
+        sys.exit("mcu-admin: that path is already a pool")
+    c = check(p)
+    if not c["ok"]:
+        sys.exit(f"mcu-admin: {p} cannot be a pool: {c.get('error')}")
+    subprocess.run(["semanage", "fcontext", "-a", "-t", "container_file_t", f"{p}(/.*)?"], capture_output=True)
+    subprocess.run(["restorecon", "-R", p], capture_output=True)
+    data["pools"][name] = {"path": p}
+    data["default"] = data.get("default") or name
+    save(); print(f"mcu-admin: pool {name} added: {p} ({c['free'] / 2**30:.0f} GB free, {c['device']})")
+elif cmd == ["budget"] and len(args) == 3:
+    # budget <mount|pool> <size>: what the box may promise there (0: disabled,
+    # no new project goes there); a usable mount with no pool yet becomes one
+    target, size = args[1], args[2].lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmgt]?)", size)
+    if not m:
+        sys.exit("mcu-admin: a size like 120g (0 to disable)")
+    nbytes = int(float(m.group(1)) * {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2)])
+    name = target if target in data["pools"] else next(
+        (n for n, sp in data["pools"].items() if os.path.realpath(sp["path"]) == os.path.realpath(target)), None)
+    if name is None:
+        if nbytes == 0:
+            print(f"mcu-admin: {target} is not in use"); sys.exit(0)
+        c = check(target)
+        if not c["ok"]:
+            sys.exit(f"mcu-admin: {target} cannot hold projects: {c.get('error')}")
+        name = re.sub(r"[^a-z0-9-]", "-", os.path.basename(os.path.realpath(target)).lower()).strip("-")[:20] or "pool"
+        while name in data["pools"]:
+            name += "x"
+        subprocess.run(["semanage", "fcontext", "-a", "-t", "container_file_t", f"{os.path.realpath(target)}(/.*)?"], capture_output=True)
+        subprocess.run(["restorecon", "-R", os.path.realpath(target)], capture_output=True)
+        data["pools"][name] = {"path": os.path.realpath(target)}
+        data["default"] = data.get("default") or name
+    c = check(data["pools"][name]["path"])
+    if nbytes > c.get("size", 0):
+        sys.exit(f"mcu-admin: {size} is more than the partition holds ({c.get('size', 0) / 2**30:.0f} GB)")
+    if c.get("system") and nbytes > c.get("free", 0) - 20 * 2**30:
+        sys.exit(f"mcu-admin: on the system's disk, keep 20 GB free for the system: at most {(c.get('free', 0) - 20 * 2**30) / 2**30:.0f} GB")
+    try:
+        usage = json.load(open(os.path.join(st, "usage.json")))
+    except (OSError, ValueError):
+        usage = {}
+    promised = sum(u.get("quota", 0) for k, u in usage.items() if not k.startswith("_") and u.get("pool") == name)
+    if nbytes and nbytes < promised:
+        sys.exit(f"mcu-admin: {size} is below the {promised / 2**30:.0f} GB already promised to the projects there")
+    data["pools"][name]["budget"] = nbytes
+    save()
+    print(f"mcu-admin: pool {name} ({data['pools'][name]['path']}): budget {nbytes / 2**30:.0f} GB"
+          + (" -- disabled: no new project goes there" if not nbytes else ""))
+elif cmd == ["default"] and len(args) == 2:
+    if args[1] not in data["pools"]:
+        sys.exit(f"mcu-admin: no pool {args[1]}")
+    data["default"] = args[1]; save(); print(f"mcu-admin: new projects go to pool {args[1]}")
+elif cmd == ["retire"] and len(args) == 2:
+    n = args[1]
+    if n not in data["pools"]:
+        sys.exit(f"mcu-admin: no pool {n}")
+    u = users_of(n)
+    if u:
+        sys.exit(f"mcu-admin: pool {n} still holds {' '.join(u)}; migrate them first")
+    if n == data.get("default") and len(data["pools"]) > 1:
+        sys.exit(f"mcu-admin: {n} is the default pool; make another one default first")
+    del data["pools"][n]
+    if data.get("default") == n:
+        data["default"] = None
+    save(); print(f"mcu-admin: pool {n} retired (its filesystem is untouched)")
+else:
+    sys.exit("mcu-admin: usage: pool list | budget <mount|pool> <size> | add <name> <path> | default <name> | retire <name>")
+PY
+    "$lib/mcu-helper" usage > /dev/null 2>&1 || true
+    ;;
+  reclaim|purge)
+    level="$1"; shift
+    [ $# -ge 1 ] || die "usage: $level <project> [--volumes] [reason]"
+    p="$1"; shift
+    check_name "$p"
+    volumes=0
+    if [ "${1:-}" = --volumes ]; then
+      [ "$level" = purge ] || die "--volumes goes with purge only"
+      volumes=1; shift
+    fi
+    reason="${*:-}"
+    [ ${#reason} -le 200 ] || die "keep the reason under 200 characters"
+    user="mcu-$p"
+    home="$(getent passwd "$user" | cut -d: -f6)" || die "no project $p"
+    [ -f "$state/projects/$p.json" ] || die "no project $p"
+    busy="$(python3 -c "
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except ValueError: d = {}
+print(' '.join(e['job'] for e in d.get('running', []) + d.get('queue', []) if e['project'] == sys.argv[2]))" "$state/state.json" "$p")"
+    [ -z "$busy" ] || die "$p has jobs queued or running ($busy); $level when they are done"
+    used() { "$lib/mcu-helper" usage > /dev/null 2>&1; python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],{}).get('used',0))" "$state/usage.json" "$p"; }
+    before="$(used)"
+    # images and build leftovers, as the project user (its rootless storage)
+    uid="$(id -u "$user")"
+    runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" HOME="$home" bash -c \
+      'cd /tmp; podman rm -a -f --external >/dev/null 2>&1; podman rmi -a -f >/dev/null 2>&1; podman image prune -a -f >/dev/null 2>&1' || true
+    find /var/tmp -maxdepth 1 -user "$user" -exec rm -rf {} + 2>/dev/null
+    rm -rf "$home"/benchfiles/build "$home"/benchfiles/build-* "$home/.bench-locks"
+    parts="images"
+    if [ "$level" = reclaim ]; then
+      # storage tagged tmp regenerates (its markers stay); so do the
+      # per-branch trees of caches from before the tag; old results
+      # (-H: a unit on another pool is a symlink in the home)
+      for marker in "$home"/cache/*/.bench-tmp; do
+        [ -f "$marker" ] || continue
+        find -H "$(dirname "$marker")" -mindepth 1 -maxdepth 1 ! -name '.bench-*' -exec rm -rf {} +
+      done
+      for marker in "$home"/cache/*/.bench-per; do
+        [ -f "$marker" ] || continue
+        find -H "$(dirname "$marker")" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+      done
+      parts="$parts, tmp storage"
+      find "$home/jobs" -mindepth 1 -maxdepth 1 -name '2*' -mtime +2 -exec rm -rf {} +
+      parts="$parts, results older than 2 days"
+    else
+      rm -rf "$home"/cache/* "$home"/cache/.git "$home"/src/* "$home"/src/.[!.]* "$home"/jobs/*
+      parts="images, caches, src, results"
+      pd="$(projects_dir "$p")"; [ -n "$pd" ] && [ -d "$pd/$p/tmp" ] && find "$pd/$p/tmp" -mindepth 1 -delete
+      if [ $volumes = 1 ]; then
+        for f in "$state"/volumes/*.json; do
+          [ -f "$f" ] || continue
+          v="$(basename "$f" .json)"
+          [ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['owner'])" "$f")" = "$p" ] || continue
+          rm -rf "/srv/mcu/volumes/$v" "$f"
+          groupdel "vol-$v" 2>/dev/null || true
+          parts="$parts, volume $v"
+        done
+      fi
+    fi
+    for dir in src cache jobs; do
+      install -d -o "$user" -g "$user" -m 700 "$home/$dir"
+    done
+    chcon -t container_file_t "$home/src" "$home/cache" "$home/jobs"
+    after="$(used)"
+    "$lib/mcu-helper" usage --parts > /dev/null 2>&1 &
+    # the project's agent is told (box, run, health) until its next good job
+    python3 - "$state" "$p" "$level" "$parts" "$before" "$after" "$reason" <<'PY'
+import fcntl, json, os, sys, time
+state, p, level, parts, before, after, reason = sys.argv[1:8]
+freed = max(int(before) - int(after), 0)
+path = os.path.join(state, "projects", f"{p}.json")
+conf = json.load(open(path))
+conf["purged"] = {"at": time.time(), "level": level, "parts": parts, "freed": freed, "reason": reason or None}
+with open(path, "w") as f:
+    json.dump(conf, f, indent=1)
+with open(os.path.join(state, "events.jsonl"), "a") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(json.dumps({"kind": "purged", "project": p, **conf["purged"], "t": time.time()}) + "\n")
+print(f"mcu-admin: {level} {p}: {parts}; {freed / 2**30:.1f} GB freed ({int(after) / 2**30:.1f} GB used now)")
+PY
+    ;;
+  revoke)
+    [ $# -eq 2 ] || die "usage: revoke <project>"
+    check_name "$2"
+    home="$(getent passwd "mcu-$2" | cut -d: -f6)" || die "no project $2"
+    : > "$home/.ssh/authorized_keys"
+    rm -f "$state/keys/$2.fingerprint"
+    echo "mcu-admin: revoked $2's key (its data stays)"
+    ;;
+  prune)
+    python3 "$lib/mcu.py" prune
+    echo "mcu-admin: pruned"
+    ;;
+  queue|maintenance)
+    # the queue's mode: open; paused (jobs are still accepted and queue, none
+    # starts); closed (new jobs are refused with exit 75, queued ones wait).
+    # Running jobs always finish. `maintenance on|off` = `queue close|open`.
+    # The only writer of queue.json: the dashboard, deploys and the shutdown
+    # task all come through here. --by names who (deploy:<pid> for a deploy,
+    # which the collector reopens if that process is gone); open --if-by
+    # reopens only a pause that is still that writer's
+    if [ "$1" = maintenance ]; then
+      case "${2:-}" in on) set -- queue close "${@:3}" ;; off) set -- queue open ;; *) die "usage: maintenance on <reason> | off" ;; esac
+    fi
+    shift
+    python3 - "$state" "$@" <<'PY'
+import datetime, fcntl, json, os, re, sys, time
+state, args = sys.argv[1], sys.argv[2:]
+USAGE = "usage: queue open [--if-by <who>] | pause <reason> [--until <time>] [--by <who>] | close <reason> [--until <time>] [--by <who>]"
+opts, rest = {}, []
+while args:
+    a = args.pop(0)
+    if a in ("--until", "--by", "--if-by"):
+        if not args or not args[0]:
+            sys.exit(f"mcu-admin: {a} needs a value")
+        opts[a] = args.pop(0)
+    else:
+        rest.append(a)
+mode = rest[0] if rest else ""
+if mode == "open" and len(rest) == 1 and not {"--until", "--by"} & set(opts):
+    pass
+elif mode in ("pause", "close") and len(rest) == 2 and rest[1].strip() and "--if-by" not in opts:
+    if len(rest[1]) > 200:
+        sys.exit("mcu-admin: keep the reason under 200 characters")
+else:
+    sys.exit("mcu-admin: " + USAGE)
+who = opts.get("--by") or os.environ.get("SUDO_USER") or "root"
+if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", who):
+    sys.exit("mcu-admin: --by: a name like deploy:1234")
+end = None
+until = opts.get("--until", "")
+if until:
+    now = datetime.datetime.now()
+    m = re.fullmatch(r"\+(\d+)([mh])", until)
+    if m:
+        end = time.time() + int(m.group(1)) * (60 if m.group(2) == "m" else 3600)
+    elif re.fullmatch(r"\d{1,2}:\d{2}", until):
+        h, mi = map(int, until.split(":"))
+        t = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        end = (t if t > now else t + datetime.timedelta(days=1)).timestamp()
+    else:
+        try:
+            end = datetime.datetime.fromisoformat(until).timestamp()
+        except ValueError:
+            sys.exit("mcu-admin: --until: 18:30, +30m, +2h or 2026-10-13T18:30")
+path = os.path.join(state, "queue.json")
+try:
+    cur = json.load(open(path))
+except (OSError, ValueError):
+    cur = {}
+if mode == "open" and "--if-by" in opts and cur.get("by") != opts["--if-by"]:
+    print(f"mcu-admin: the queue is {cur.get('mode', 'open')}, not by {opts['--if-by']}: left as it is")
+    sys.exit(0)
+queue = {"open": "open", "pause": "paused", "close": "closed"}[mode]
+reason = rest[1] if len(rest) > 1 else None
+q = {"mode": queue, "reason": reason, "since": time.time(), "until": end, "by": who}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(q, f)
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+# the event tells the dashboard now rather than at the collector's next minute
+with open(os.path.join(state, "events.jsonl"), "a") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(json.dumps({"kind": "box", "queue": queue, "maintenance": reason if queue == "closed" else None,
+                        "hold": reason, "by": who, "t": time.time()}) + "\n")
+print({"open": "mcu-admin: queue open",
+       "paused": f"mcu-admin: queue paused ({reason}): jobs are accepted but none starts; running ones finish",
+       "closed": f"mcu-admin: queue closed ({reason}): new jobs are refused (exit 75), queued ones wait, running ones finish"}[queue])
+PY
+    ;;
+  passwd)
+    if [ "${2:-}" = --generate ]; then
+      # 20 characters from letters and digits, printed once
+      pw="$(python3 -c "import secrets, string; a = string.ascii_letters + string.digits; print(''.join(secrets.choice(a) for _ in range(20)))")"
+      echo "$pw"
+    elif [ -t 0 ]; then read -rsp "admin password: " pw; echo
+    else read -r pw
+    fi
+    [ ${#pw} -ge 10 ] || die "use at least 10 characters"
+    PW="$pw" python3 - <<'PY'
+import hashlib, json, os, secrets
+salt = secrets.token_bytes(16)
+h = hashlib.scrypt(os.environ["PW"].encode(), salt=salt, n=2**15, r=8, p=1, maxmem=2**26)
+json.dump({"user": "admin", "salt": salt.hex(), "scrypt": h.hex()},
+          open("/etc/mcu/admin.json", "w"))
+PY
+    chgrp mcu-web /etc/mcu/admin.json && chmod 640 /etc/mcu/admin.json
+    # a new password ends every session
+    rm -f /var/lib/mcu-web/sessions.json
+    systemctl try-restart mcu-dashboard.service 2> /dev/null || true
+    echo "mcu-admin: dashboard admin password set (user: admin)"
+    ;;
+  config)
+    # config show [--origin] [--json]: each setting in force and where it
+    # comes from (default, computed from the machine, or box.toml); --origin
+    # groups them with box.toml's line, the default, who may change each and
+    # when a change takes effect
+    [ "${2:-}" = show ] || die "usage: config show [--origin] [--json]"
+    shift
+    exec python3 "$here/mcuconf.py" "$@"
+    ;;
+  --version)
+    exec python3 "$here/mcuconf.py" get version
+    ;;
+  doctor)
+    # doctor: what this machine has and lacks for mcu, read-only; one line
+    # per check (ok / missing / optional), with the command that fixes it.
+    # Run it before an install and after; exit 1 while something required
+    # is missing
+    bad=0
+    echo "mcu $(python3 "$here/mcuconf.py" get version 2> /dev/null)"
+    say() {  # say ok|missing|optional|info <what> [fix]
+      printf '%-9s %s%s\n' "$1" "$2" "${3:+  ->  $3}"
+      [ "$1" = missing ] && bad=1
+      return 0
+    }
+    . /etc/os-release 2> /dev/null || true
+    if [ "${ID:-}" = fedora ] && [ "${VERSION_ID:-0}" -ge 42 ] 2> /dev/null; then
+      say ok "distribution: Fedora $VERSION_ID"
+    else
+      say info "distribution: ${PRETTY_NAME:-unknown} (untested: mcu is tested on Fedora 42 and later)"
+    fi
+    virt="$(systemd-detect-virt 2> /dev/null || true)"
+    [ -n "$virt" ] && [ "$virt" != none ] && say info "virtual machine ($virt): timings are not comparable, see docs/VM.md"
+    py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2> /dev/null || echo 0)"
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2> /dev/null \
+      && say ok "python $py" || say missing "python >= 3.11 (tomllib)" "dnf install python3"
+    pv="$(podman --version 2> /dev/null | awk '{print $3}')"
+    [ "${pv%%.*}" -ge 5 ] 2> /dev/null && say ok "podman $pv" || say missing "podman >= 5" "dnf install podman"
+    for tool in newuidmap:shadow-utils rrdtool:rrdtool smartctl:smartmontools xfs_quota:xfsprogs openssl:openssl \
+                unshare:util-linux semanage:policycoreutils-python-utils; do
+      command -v "${tool%%:*}" > /dev/null && say ok "${tool%%:*}" || say missing "${tool%%:*}" "dnf install ${tool#*:}"
+    done
+    [ -x /usr/libexec/openssh/sftp-server ] && say ok "sftp-server (the projects' read-only view)" \
+      || say missing "sftp-server" "dnf install openssh-server"
+    [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] && say ok "cgroup v2" \
+      || say missing "cgroup v2" "boot with systemd.unified_cgroup_hierarchy=1"
+    if [ -f /etc/systemd/system/user@.service.d/mcu-delegate.conf ]; then
+      say ok "cgroup controllers delegated to the projects (cpuset for pinning)"
+    else
+      say missing "cgroup controllers delegated to the projects" "mcu-admin init"
+    fi
+    selinux="$(getenforce 2> /dev/null || echo absent)"
+    [ "$selinux" = Enforcing ] && say ok "SELinux enforcing" || say info "SELinux $selinux (mcu is tested enforcing)"
+    # where the projects' data lives: pools with XFS project quotas, or / with user quotas
+    pools="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(' '.join(p['path'] for p in d['pools'].values()))" "$state/pools.json" 2> /dev/null || true)"
+    if [ -z "$pools" ]; then
+      if xfs_quota -x -c "state -u" / 2> /dev/null | grep -q "Enforcement: ON"; then
+        say ok "user quotas on / (no data pool yet: mcu-admin pool add)"
+      else
+        say missing "a place with disk quotas for the projects" "an XFS filesystem mounted with prjquota, then mcu-admin pool add <name> <path>"
+      fi
+    fi
+    for pp in $pools; do
+      mnt="$(df --output=target "$pp" 2> /dev/null | tail -1)"
+      if [ "$(stat -fc %T "$pp" 2> /dev/null)" = xfs ] && xfs_quota -x -c "state -p" "$mnt" 2> /dev/null | grep -q "Enforcement: ON"; then
+        say ok "pool $pp: XFS, project quotas enforced"
+      elif [ "$(stat -fc %T "$pp" 2> /dev/null)" = xfs ] && xfs_quota -x -c "state -u" "$mnt" 2> /dev/null | grep -q "Enforcement: ON"; then
+        say ok "pool $pp: XFS, user quotas enforced (on $mnt, the project's user quota polices it)"
+      else
+        say missing "pool $pp: XFS with project quotas" "mount $mnt with the prjquota option (fstab), then reboot or remount"
+      fi
+    done
+    # what init installs and runs
+    [ -x "$lib/mcu.py" ] && [ -x /usr/local/bin/mcu-job ] && say ok "mcu installed in $lib" \
+      || say missing "mcu's files" "make install (or mcu-admin init from a checkout)"
+    [ -f /etc/sudoers.d/mcu ] && visudo -cqf /etc/sudoers.d/mcu && say ok "sudoers rule" || say missing "sudoers rule" "mcu-admin init"
+    for unit in mcu-dashboard.service mcu-task.service mcu-collect.timer mcu-usage.timer mcu-prune.timer; do
+      systemctl is-active -q "$unit" && say ok "$unit running" || say missing "$unit" "mcu-admin init"
+    done
+    port="$(python3 "$here/mcuconf.py" get dashboard_port 2> /dev/null || echo 8080)"
+    ss -ltn 2> /dev/null | grep -q ":$port " && say ok "dashboard listening on port $port" \
+      || say missing "dashboard on port $port" "systemctl restart mcu-dashboard"
+    # optional hardware: used when present, the box works without it (box/hw)
+    (cd "$here" && python3 -m hw)
+    exit $bad
+    ;;
+  uninstall)
+    # uninstall [--purge [--yes]]: mcu off this machine. By default the
+    # services, code, units, sudoers, udev rules and firewall port go, and
+    # the data stays (/var/lib/mcu, /etc/mcu, the pools, the project
+    # accounts): an install puts the box back as it was. --purge removes
+    # those too, refused while jobs run, after typing "purge" (or --yes)
+    [ $# -le 3 ] || die "usage: uninstall [--purge [--yes]]"
+    purge=0; yes=0
+    for a in "${@:2}"; do
+      case "$a" in --purge) purge=1 ;; --yes) yes=1 ;; *) die "usage: uninstall [--purge [--yes]]" ;; esac
+    done
+    if [ $purge = 1 ]; then
+      n=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('running', [])))" "$state/state.json" 2> /dev/null || echo 0)
+      [ "$n" = 0 ] || die "$n job(s) running: the purge waits for them (mcu-admin queue close, then again)"
+      if [ $yes = 0 ]; then
+        echo "uninstall --purge removes every project's account, results, storage and volumes, and the box's settings."
+        read -rp 'type "purge" to go on: ' answer
+        [ "$answer" = purge ] || die "nothing removed"
+      fi
+    fi
+    port="$(python3 "$here/mcuconf.py" get dashboard_port 2> /dev/null || echo 8080)"
+    for unit in mcu-dashboard.service mcu-task.service mcu-recover.service mcu-power.service mcu-egpu-shutdown.service \
+                mcu-prune.timer mcu-usage.timer mcu-collect.timer mcu-prune.service mcu-usage.service mcu-collect.service; do
+      systemctl disable --now "$unit" > /dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$unit"
+    done
+    rm -f /etc/systemd/system/user@.service.d/mcu-delegate.conf /etc/systemd/system.conf.d/mcu-reboot-watchdog.conf \
+          /etc/udev/rules.d/90-mcu-egpu.rules /etc/udev/rules.d/91-mcu-rapl.rules /etc/sudoers.d/mcu /usr/local/bin/mcu-job \
+          /usr/local/sbin/mcu-admin
+    systemctl daemon-reload
+    udevadm control --reload 2> /dev/null || true
+    firewall-cmd -q --permanent --remove-port="$port/tcp" 2> /dev/null && firewall-cmd -q --reload 2> /dev/null || true
+    rm -rf "$lib"
+    if [ $purge = 0 ]; then
+      echo "mcu-admin: uninstalled; kept: $state, /etc/mcu, the pools and the project accounts (uninstall --purge removes them)"
+      exit 0
+    fi
+    pools="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(' '.join(p['path'] for p in d['pools'].values()))" "$state/pools.json" 2> /dev/null || true)"
+    for u in $(getent passwd | cut -d: -f1 | grep '^mcu-'); do
+      loginctl disable-linger "$u" 2> /dev/null || true
+      loginctl terminate-user "$u" 2> /dev/null || true
+      pkill -KILL -u "$u" 2> /dev/null || true
+      p="${u#mcu-}"
+      for pp in $pools; do rm -rf --one-file-system "${pp:?}/$p"; done
+      userdel -r "$u" 2> /dev/null || userdel "$u" 2> /dev/null || true
+      echo "mcu-admin: removed $u and its data"
+    done
+    getent group mcu > /dev/null && groupdel mcu
+    semanage fcontext -l -C 2> /dev/null | awk '$1 ~ "^/srv/mcu" {print $1}' | while read -r spec; do
+      semanage fcontext -d "$spec" 2> /dev/null || true
+    done
+    rm -rf --one-file-system "$state" /var/lib/mcu-web /etc/mcu /srv/mcu
+    echo "mcu-admin: purged (pools outside /srv/mcu keep their own filesystems, now empty of mcu)"
+    ;;
+  migrate-name)
+    # migrate-name [--reverse] | --drop-aliases: a box installed under the
+    # first name (bench) becomes mcu: accounts, groups, paths, units,
+    # sudoers, SELinux contexts, the forced command in each key. The uids
+    # do not change, so file ownership, XFS project quotas (id = uid),
+    # /run/user/<uid> and lingering stay valid. The queue is closed and
+    # running jobs are waited for first; everything changed is backed up,
+    # and --reverse puts it back. Each project keeps a bench-<project>
+    # alias (same uid, same home) so old clients still log in, until
+    # --drop-aliases. Idempotent: a step already done is skipped.
+    mode="${2:-}"
+    [ $# -le 2 ] && { [ -z "$mode" ] || [ "$mode" = --reverse ] || [ "$mode" = --drop-aliases ]; } \
+      || die "usage: migrate-name [--reverse | --drop-aliases]"
+    if [ "$mode" = --drop-aliases ]; then
+      for u in $(getent passwd | cut -d: -f1 | grep '^bench-' | grep -v '^bench-web$'); do
+        p="${u#bench-}"
+        [ "$(id -u "$u")" = "$(id -u "mcu-$p" 2> /dev/null)" ] || continue   # only an alias, never a real account
+        for g in $(getent group | awk -F: -v a="$u" '("," $4 ",") ~ ("," a ",") {print $1}'); do
+          gpasswd -d "$u" "$g" > /dev/null
+        done
+        sed -i "/^$u:/d" /etc/passwd /etc/shadow
+        echo "migrate-name: alias $u removed"
+      done
+      exit 0
+    fi
+    if [ "$mode" = --reverse ]; then
+      old=mcu new=bench
+      "$0" migrate-name --drop-aliases   # bench-<p> becomes the real name again
+    else
+      old=bench new=mcu
+    fi
+    backup=/root/mcu-migrate-name
+    [ "$mode" = --reverse ] && [ ! -d "$backup" ] && die "no backup at $backup: nothing to reverse"
+    oldstate=/var/lib/$old
+    [ -d "$oldstate" ] || { echo "migrate-name: no /var/lib/$old: already done"; exit 0; }
+    # the queue closes and running jobs end (the old code still runs them)
+    if [ -f "$oldstate/state.json" ]; then
+      printf '{"reason": "renaming the box (%s -> %s)", "since": %s}\n' "$old" "$new" "$(date +%s)" > "$oldstate/maintenance.json"
+      for i in $(seq 1 7200); do
+        n=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('running', [])))" "$oldstate/state.json" 2> /dev/null || echo 0)
+        [ "$n" = 0 ] && break
+        [ "$i" = 1 ] && echo "migrate-name: waiting for $n running job(s)"
+        sleep 3
+      done
+      [ "$n" = 0 ] || die "jobs still running after 6 h; nothing changed"
+    fi
+    # one backup per migration, made by its first run (a rerun after a
+    # failure must not save the half-renamed state over it); --reverse
+    # files it away, so a later migration takes a fresh one
+    if [ "$mode" != --reverse ] && [ ! -d "$backup" ]; then
+      echo "migrate-name: backup in $backup"
+      install -d -m 700 "$backup"
+      cp -a /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/subuid /etc/subgid "$backup/" 2> /dev/null || true
+      cp -a /etc/sudoers.d/bench "$backup/" 2> /dev/null || true
+      cp -a /etc/systemd/system/bench-* "$backup/" 2> /dev/null || true
+      cp -a /etc/bench "$backup/etc-bench" 2> /dev/null || true
+      cp -a /usr/local/lib/bench "$backup/lib-bench" 2> /dev/null || true
+      semanage fcontext -l -C 2> /dev/null | grep '/srv/bench' > "$backup/fcontext" || true
+    fi
+    # the services stop, so nothing holds the old paths or accounts
+    # (only those the rename touches: mcu-egpu-shutdown and mcu-power had
+    # their name before)
+    renamed_units="dashboard.service task.service recover.service prune.service prune.timer usage.service usage.timer collect.service collect.timer"
+    for unit in $renamed_units; do
+      systemctl disable --now "$old-$unit" > /dev/null 2>&1 || true
+    done
+    # the accounts: projects (bench-<p>), the dashboard's user, the groups
+    for u in $(getent passwd | cut -d: -f1 | grep "^$old-"); do
+      nu="$new-${u#$old-}"
+      getent passwd "$nu" > /dev/null && [ "$(id -u "$nu")" != "$(id -u "$u")" ] && die "$nu exists with another uid"
+      # an alias left from a previous run: the real account is already renamed
+      [ "$(getent passwd | awk -F: -v uid="$(id -u "$u")" '$3 == uid' | wc -l)" -gt 1 ] && continue
+      loginctl disable-linger "$u" 2> /dev/null || true
+      loginctl terminate-user "$u" 2> /dev/null || true
+      # usermod refuses while a process runs as the user: wait for them all
+      for _ in $(seq 1 100); do
+        pkill -KILL -u "$u" 2> /dev/null || break
+        sleep 0.2
+      done
+      pgrep -u "$u" > /dev/null && die "processes of $u do not end; rerun migrate-name (done steps are skipped)"
+      oldhome="$(getent passwd "$u" | cut -d: -f6)"
+      newhome="${oldhome/\/$old-/\/$new-}"
+      if [ -d "$oldhome" ]; then
+        usermod -l "$nu" -d "$newhome" -m "$u"
+      else
+        usermod -l "$nu" -d "$newhome" "$u"   # a home never made (the dashboard's user)
+      fi
+      getent group "$u" > /dev/null && groupmod -n "$nu" "$u"
+      sed -i "s/^$u:/$nu:/" /etc/subuid /etc/subgid
+      [ "$nu" != "$new-web" ] && loginctl enable-linger "$nu" 2> /dev/null || true
+      echo "migrate-name: $u -> $nu ($newhome)"
+    done
+    getent group "$old" > /dev/null && groupmod -n "$new" "$old"
+    # the paths, on their own filesystems (a rename, instant)
+    for d in /var/lib/$old-web /var/lib/$old /etc/$old /srv/$old; do
+      [ -e "$d" ] && [ ! -e "${d/\/$old/\/$new}" ] && mv "$d" "${d/\/$old/\/$new}"
+    done
+    # links and files that name the old paths: units' links in each home,
+    # podman's storage.conf, the pools, the projects' settings
+    for h in /home/$new-*; do
+      [ -d "$h" ] || continue
+      find "$h" -maxdepth 3 -type l 2> /dev/null | while read -r l; do
+        t="$(readlink "$l")"
+        case "$t" in
+          /srv/$old/*|/home/$old-*) ln -sfn "$(echo "$t" | sed "s#/srv/$old/#/srv/$new/#; s#/home/$old-#/home/$new-#")" "$l" ;;
+        esac
+      done
+      f="$h/.config/containers/storage.conf"
+      [ -f "$f" ] && sed -i "s#/srv/$old/#/srv/$new/#g; s#/home/$old-#/home/$new-#g" "$f"
+      ak="$h/.ssh/authorized_keys"
+      [ -f "$ak" ] && sed -i "s#/usr/local/bin/$old-job#/usr/local/bin/$new-job#" "$ak"
+    done
+    # the machine's settings name the data filesystem (projects_dir): the
+    # installed box.toml, and this checkout's box.local.toml for a later
+    # init --config
+    for f in /var/lib/$new/pools.json /var/lib/$new/projects/*.json /var/lib/$new/volumes/*.json \
+        /etc/$new/box.toml "$here/box.local.toml"; do
+      [ -f "$f" ] && sed -i "s#/srv/$old/#/srv/$new/#g; s#/home/$old-#/home/$new-#g" "$f"
+    done
+    # SELinux: the same contexts on the new paths
+    semanage fcontext -l -C 2> /dev/null | awk -v o="/srv/$old" '$1 ~ "^"o {print $1, $NF}' | while read -r spec ctx; do
+      t="$(echo "$ctx" | cut -d: -f3)"
+      semanage fcontext -a -t "$t" "${spec/\/srv\/$old/\/srv\/$new}" 2> /dev/null || true
+      semanage fcontext -d "$spec" 2> /dev/null || true
+    done
+    [ -d /srv/$new ] && restorecon -R /srv/$new
+    # the old system files go; init writes the new ones
+    rm -f /etc/sudoers.d/$old /usr/local/bin/$old-job /etc/systemd/system/user@.service.d/$old-delegate.conf
+    for unit in $renamed_units; do rm -f "/etc/systemd/system/$old-$unit"; done
+    systemctl daemon-reload
+    # podman's database remembers the storage paths it was created with and
+    # refuses to start when storage.conf names others ("database static dir
+    # ... does not match"): the same paths, renamed, in each project's db
+    for db in /srv/$new/projects/*/containers/db.sql; do
+      [ -f "$db" ] || continue
+      p="$(basename "$(dirname "$(dirname "$db")")")"
+      cp -a "$db" "$backup/$p.db.sql.$(date +%Y%m%d-%H%M%S)" 2> /dev/null || true
+      python3 - "$db" "/srv/$old/" "/srv/$new/" << 'EOF'
+import sqlite3, sys
+db, old, new = sys.argv[1:]
+c = sqlite3.connect(db)
+for col in ("StaticDir", "GraphRoot", "VolumeDir"):
+    c.execute(f"update DBConfig set {col} = replace({col}, ?, ?)", (old, new))
+c.commit()
+EOF
+    done
+    # the projects' user managers were stopped to rename the accounts: they
+    # come back now (podman needs /run/user/<uid>), not only at the next boot
+    for f in /var/lib/systemd/linger/$new-*; do
+      [ -e "$f" ] || continue
+      uid="$(id -u "$(basename "$f")" 2> /dev/null)" || continue
+      systemctl reset-failed "user@$uid.service" 2> /dev/null || true
+      systemctl start "user@$uid.service" 2> /dev/null || echo "migrate-name: user@$uid.service does not start (see journalctl -u user@$uid)"
+    done
+    if [ "$mode" = --reverse ]; then
+      # the old code, from the backup, installs the old names again
+      [ -f "$backup/sudoers.d-bench" ] || cp -a "$backup/bench" /etc/sudoers.d/bench 2> /dev/null || true
+      cp -a "$backup"/bench-*.service "$backup"/bench-*.timer /etc/systemd/system/ 2> /dev/null || true
+      rm -rf /usr/local/lib/bench && cp -a "$backup/lib-bench" /usr/local/lib/bench
+      printf '#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/bench/bench.py entry\n' > /usr/local/bin/bench-job && chmod 755 /usr/local/bin/bench-job
+      rm -rf /usr/local/lib/mcu /etc/sudoers.d/mcu /usr/local/bin/mcu-job /etc/systemd/system/user@.service.d/mcu-delegate.conf
+      printf '[Service]\nDelegate=cpu cpuset io memory pids\n' > /etc/systemd/system/user@.service.d/bench-delegate.conf
+      systemctl daemon-reload
+      for unit in bench-dashboard.service bench-task.service bench-recover.service bench-prune.timer bench-usage.timer bench-collect.timer; do
+        systemctl enable --now "$unit" > /dev/null 2>&1 || true
+      done
+      rm -f /var/lib/bench/maintenance.json
+      mv "$backup" "$backup.reversed-$(date +%Y%m%d-%H%M%S)"
+      echo "migrate-name: reversed; the queue is open again"
+      exit 0
+    fi
+    # the new names installed from this checkout, then the aliases
+    "$0" init
+    rm -rf /usr/local/lib/bench   # the old code (in the backup, for --reverse)
+    for u in $(getent passwd | cut -d: -f1 | grep '^mcu-' | grep -v '^mcu-web$'); do
+      a="bench-${u#mcu-}"
+      getent passwd "$a" > /dev/null && continue
+      IFS=: read -r _ _ uid gid _ home shell < <(getent passwd "$u")
+      echo "$a:x:$uid:$gid:alias of $u (until migrate-name --drop-aliases):$home:$shell" >> /etc/passwd
+      echo "$a:*:$(($(date +%s) / 86400)):0:99999:7:::" >> /etc/shadow
+      # the account's groups (mcu, to read the state) go by name: the alias joins them
+      for g in $(getent group | awk -F: -v u="$u" '("," $4 ",") ~ ("," u ",") {print $1}'); do
+        gpasswd -a "$a" "$g" > /dev/null
+      done
+    done
+    rm -f /var/lib/mcu/maintenance.json
+    "$0" queue open > /dev/null   # init turned the renaming's closure into queue.json
+    echo "migrate-name: done; the queue is open. Check: mcu-admin status, and a job on each project"
+    ;;
+  list)
+    for f in "$state"/projects/*.json; do
+      [ -f "$f" ] || continue
+      p="$(basename "$f" .json)"
+      key=revoked; [ -s "$state/keys/$p.fingerprint" ] && key="$(cat "$state/keys/$p.fingerprint")"
+      printf '%-12s %s  key %s\n' "$p" "$(tr -d '\n ' < "$f")" "$key"
+    done
+    ;;
+  *)
+    die "usage: init | config show | doctor | uninstall [--purge] | invite <project> | revoke <project> | migrate-name [--reverse | --drop-aliases] | reclaim | purge | migrate | gpu | pool | envelope | task | timing | prune | queue | maintenance | passwd | list"
+    ;;
+esac

@@ -1,0 +1,23 @@
+# What an install puts on the box: one line per file, read by box/install-files
+# (make install, mcu-admin init) and by mcuctl admin deploy (its --parts).
+# part     source            installed as (in /usr/local/lib/mcu)   mode  service restarted on deploy
+mcu        box/mcu.py        mcu.py                                 755   -
+conf       box/mcuconf.py    mcuconf.py                             644   -
+version    VERSION           VERSION                                644   -
+hw         box/hw/__init__.py    hw/__init__.py                     644   -
+hw         box/hw/__main__.py    hw/__main__.py                     644   -
+hw         box/hw/_sys.py        hw/_sys.py                         644   -
+hw         box/hw/cpufreq.py     hw/cpufreq.py                      644   -
+hw         box/hw/drm.py         hw/drm.py                          644   -
+hw         box/hw/egpu.py        hw/egpu.py                         644   -
+hw         box/hw/nvidia.py      hw/nvidia.py                       644   -
+hw         box/hw/rapl.py        hw/rapl.py                         644   -
+hw         box/hw/smart.py       hw/smart.py                        644   -
+hw         box/hw/thunderbolt.py hw/thunderbolt.py                  644   -
+hw         box/hw/virt.py        hw/virt.py                         644   -
+helper     box/mcu-helper    mcu-helper                             755   -
+admin      box/mcu-admin     mcu-admin                              755   -
+task       box/mcu-task      mcu-task                               755   mcu-task
+api        box/api.py        api.py                                 644   mcu-dashboard
+collect    box/collect.py    collect.py                             644   -
+docs       docs/USING.md     USING.md                               644   -

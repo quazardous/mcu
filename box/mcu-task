@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""The mcu box's admin task worker (mcu-task.service, root): the long
+admin operations the dashboard queues (migrate, purge, reclaim, prune, gpu
+eject or attach) run
+here, one at a time, instead of inside a web request.
+
+    mcu-task worker          the service: take queued tasks, run them
+    mcu-task add <kind> [args...]   queue one (mcu-admin task add)
+    mcu-task list | show <id> | cancel <id>
+
+A task is /var/lib/mcu/tasks/<id>.json (kind, args, state queued |
+waiting | running | done | failed | cancelled | interrupted, exit code, the
+last progress line) and <id>.log, the command's output. Each change is a
+`task` event in events.jsonl, so the dashboard follows it live.
+
+Nothing is refused for being busy: a task queues. Tasks of one project run
+in order (a unit move only waits for tasks on the same unit, or a whole-
+project one); different projects' tasks run side by side. A move whose unit
+a job is using is `waiting`: the scheduler starts no new job on that unit,
+and the move begins when the running ones end. A queued or waiting task can
+be cancelled; once it copies, it runs to the end. A gpu task (eject,
+attach) starts only 10 s after it was queued, time to cancel a click.
+"""
+
+import fcntl
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+STATE = Path("/var/lib/mcu")
+TASKS = STATE / "tasks"
+ADMIN = "/usr/local/lib/mcu/mcu-admin"
+KINDS = {"migrate", "purge", "reclaim", "prune", "gpu", "shutdown"}
+
+
+def event(**fields):
+    fields["t"] = time.time()
+    with open(STATE / "events.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(fields) + "\n")
+
+
+def helper(*args):
+    subprocess.run(["/usr/bin/python3", str(Path(__file__).resolve().parent / "mcu-helper"), *args], capture_output=True)
+
+
+def save(task):
+    path = TASKS / f"{task['id']}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(task, indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    event(kind="task", id=task["id"], task_kind=task["kind"], state=task["state"],
+          progress=task.get("progress"), percent=task.get("percent"), args=task["args"])
+
+
+def load(task_id):
+    return json.loads((TASKS / f"{task_id}.json").read_text())
+
+
+def tasks():
+    out = []
+    for p in sorted(TASKS.glob("*.json")):
+        try:
+            out.append(json.loads(p.read_text()))
+        except ValueError:
+            pass
+    return out
+
+
+# seconds a task of this kind waits once queued before it starts, so a
+# click on eject or re-attach can still be cancelled
+GRACE = {"gpu": 10}
+
+
+def add(kind, args):
+    if kind not in KINDS:
+        sys.exit(f"mcu-task: unknown kind {kind} (one of {', '.join(sorted(KINDS))})")
+    if any(not re.fullmatch(r"[A-Za-z0-9._/@:+ -]{0,200}", a) for a in args):
+        sys.exit("mcu-task: bad argument")
+    TASKS.mkdir(mode=0o755, exist_ok=True)
+    same = [t for t in tasks() if t["state"] in ("queued", "waiting", "running")
+            and t["kind"] == kind and t["args"] == args]
+    if same:
+        sys.exit(f"mcu-task: the same {kind} is already {same[0]['state']} ({same[0]['id']})")
+    now = time.time()
+    grace = GRACE.get(kind, 0)
+    task = {"id": time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2), "kind": kind, "args": args,
+            "state": "queued", "created": now, "started": None, "ended": None,
+            "code": None, "progress": f"starts in {grace} s unless cancelled" if grace else None,
+            "not_before": now + grace if grace else None}
+    save(task)
+    if kind == "gpu" and args[:1] == ["eject"]:
+        helper("gpu-pending", "on")     # new GPU jobs refused from the click on
+    print(task["id"])
+
+
+def unit_of(t):
+    return t["args"][1] if t["kind"] == "migrate" and len(t["args"]) == 3 else None
+
+
+def conflicts(a, b):
+    """must task b wait for task a (same project, and not two different
+    units); prune touches every project"""
+    if "prune" in (a["kind"], b["kind"]):
+        return True
+    if "gpu" in (a["kind"], b["kind"]):       # an eject and an attach, one after the other
+        return a["kind"] == b["kind"]
+    if "shutdown" in (a["kind"], b["kind"]):  # beside the rest (it waits for jobs, ejects the GPU itself)
+        return a["kind"] == b["kind"]
+    if a["args"][:1] != b["args"][:1]:
+        return False
+    return unit_of(a) is None or unit_of(b) is None or unit_of(a) == unit_of(b)
+
+
+def run(task):
+    task = load(task["id"])
+    if task["state"] != "queued":   # cancelled meanwhile
+        return
+    task.update(state="running", started=time.time(), progress=None)
+    save(task)
+    log = TASKS / f"{task['id']}.log"
+    last_save = 0
+    step, pct_in = (0, 1), 0
+    with open(log, "w") as out:
+        os.chmod(log, 0o644)
+        proc = subprocess.Popen([ADMIN, task["kind"], *task["args"]], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+        task["pid"] = proc.pid
+        save(task)
+        buf = ""
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            out.write(ch)
+            if ch in "\r\n":
+                line = buf.strip()
+                buf = ""
+                # rsync --info=progress2 lines and the commands' own steps
+                # a move waiting for its unit: cancellable until it starts
+                if line.startswith("waiting:"):
+                    task.update(state="waiting", progress=line[len("waiting:"):].strip()[:200])
+                    save(task)
+                elif task["state"] == "waiting" and line.startswith("progress:"):
+                    task["state"] = "running"
+                    last_save = 0
+                if line and (line.startswith("progress:") or "%" in line or line.startswith("mcu-admin:")):
+                    task["progress"] = line.replace("progress:", "").strip()[:200]
+                    # a global estimate: steps "k/n" from the command, and
+                    # within a step the copy's own percentage (rsync)
+                    m = re.search(r"step (\d+)/(\d+)", line)
+                    if m:
+                        step = (int(m.group(1)) - 1, int(m.group(2)))
+                        pct_in = 0
+                    m = re.search(r"\s(\d{1,3})%\s", f" {line} ")
+                    if m:
+                        pct_in = min(int(m.group(1)), 100)
+                    task["percent"] = round(100 * (step[0] + pct_in / 100) / step[1])
+                    if time.time() - last_save > 2:
+                        save(task)
+                        last_save = time.time()
+                out.flush()
+            else:
+                buf += ch
+        proc.wait()
+    flag = TASKS / f"{task['id']}.cancel"
+    if flag.exists():
+        flag.unlink()
+        # a move cancelled while it waited for its unit had not started; a
+        # restart cancelled during its steps undid what it had done
+        task.update(code=proc.returncode, ended=time.time(), state="cancelled",
+                    progress="cancelled, what it had done is undone" if task["kind"] == "shutdown" else "cancelled before it started")
+    else:
+        task.update(code=proc.returncode, ended=time.time(), state="done" if proc.returncode == 0 else "failed",
+                    percent=100 if proc.returncode == 0 else task.get("percent"))
+    save(task)
+
+
+def worker():
+    TASKS.mkdir(mode=0o755, exist_ok=True)
+    # a task the last stop cut short is not running any more
+    for t in tasks():
+        if t["state"] in ("running", "waiting"):
+            t.update(state="interrupted", ended=time.time())
+            save(t)
+    live = {}   # id -> thread
+    while True:
+        for i in [i for i, th in live.items() if not th.is_alive()]:
+            del live[i]
+        active = [t for t in tasks() if t["id"] in live]
+        for t in sorted((t for t in tasks() if t["state"] == "queued"), key=lambda t: t["created"]):
+            # in order within a project: behind what runs and what queued first
+            if any(conflicts(a, t) for a in active):
+                continue
+            if (t.get("not_before") or 0) > time.time():
+                active.append(t)        # not yet: what queued behind it still waits for it
+                continue
+            th = threading.Thread(target=run, args=(t,), daemon=True)
+            live[t["id"]] = th
+            active.append(t)
+            th.start()
+        time.sleep(1)
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["worker"]:
+        worker()
+    elif args[:1] == ["add"] and len(args) >= 2:
+        add(args[1], args[2:])
+    elif args == ["list"]:
+        for t in tasks()[-30:]:
+            print(f"{t['id']}  {t['state']:<11} {t['kind']} {' '.join(t['args'])}  {t.get('progress') or ''}")
+    elif args[:1] == ["show"] and len(args) == 2:
+        print(json.dumps(load(args[1]), indent=1))
+        log = TASKS / f"{args[1]}.log"
+        if log.exists():
+            print(log.read_text()[-4000:])
+    elif args[:1] == ["cancel"] and len(args) == 2:
+        t = load(args[1])
+        if t["state"] == "queued":
+            t.update(state="cancelled", ended=time.time(), progress="cancelled before it started")
+            save(t)
+            if t["kind"] == "gpu" and t["args"][:1] == ["eject"]:
+                helper("gpu-pending", "off")
+        elif t["state"] == "waiting" and t.get("pid"):
+            # the worker sees it end and records it cancelled
+            (TASKS / f"{t['id']}.cancel").touch()
+            try:
+                os.killpg(t["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            sys.exit(f"mcu-task: {t['id']} is {t['state']}; only a task not started yet (queued or waiting) can be cancelled")
+        print(f"mcu-task: {t['id']} cancelled")
+    else:
+        sys.exit("mcu-task: usage: worker | add <kind> [args...] | list | show <id> | cancel <id>")
+
+
+if __name__ == "__main__":
+    main()

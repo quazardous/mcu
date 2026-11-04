@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Tooling only: mcu's box runs on the standard library and installs with make.
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# lambdas bound to names and one-letter names (l, e) are how this code reads
+ignore = ["E501", "E731", "E741"]

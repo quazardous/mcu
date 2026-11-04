@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: MIT
+# On every push and pull request: the unit tests (no root, no hardware), the
+# tracker-reference check, lint, and the dashboard's build with svelte-check.
+# On a tag: the release tarball, attached to the run.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff shellcheck-py
+      - run: make check
+      - run: make lint RUFF=ruff SHELLCHECK=shellcheck
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+        working-directory: dashboard
+      - run: npm run build
+        working-directory: dashboard
+      - run: npx --yes svelte-check@4 --workspace .
+        working-directory: dashboard
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, dashboard]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: make dist
+      - run: sha256sum mcu-*.tar.gz > SHA256SUMS
+      # the notes: the CHANGELOG's section for this version
+      - run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+      - run: gh release create "$GITHUB_REF_NAME" mcu-*.tar.gz SHA256SUMS --title "mcu ${GITHUB_REF_NAME#v}" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

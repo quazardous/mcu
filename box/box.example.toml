@@ -1,0 +1,84 @@
+# The box's own settings, /etc/mcu/box.toml. Copy this file to
+# box/box.local.toml before the first `mcu-admin init`, which installs it;
+# afterwards /etc/mcu/box.toml is the machine's own file.
+#
+# Every line here is commented out and shows the default: a copy as it is
+# changes nothing. Uncomment what this machine needs. `mcu-admin config show`
+# prints each setting in force and where it comes from (default, computed from
+# the machine, or box.toml). The dashboard writes its changes into this file.
+
+# Threads kept for the system, never given to a job. Default: the first
+# physical core (cpu0 and its hyper-thread sibling). See lscpu -e=CPU,CORE.
+# reserved = "0,6"
+
+# Memory kept for the system; the rest is shared by the jobs. Default: 10 % of
+# the machine's memory, 2g at least. ([envelope] jobs_memory says the shared
+# amount directly instead.)
+# reserved_memory = "2g"
+
+# How long a waiting job may be passed by smaller ones (backfill) before
+# nothing that could delay it passes it. A job may set its own max_wait.
+# backfill_max_wait = "30m"
+
+# The dashboard's port (HTTPS, LAN), and its own certificate and key (PEM)
+# instead of the self-signed pair init makes in /etc/mcu.
+# dashboard_port = 8080
+# tls_cert = "/etc/pki/tls/certs/box.pem"
+# tls_key = "/etc/pki/tls/private/box.key"
+
+# Where projects' data lives when the box has no pool yet: a filesystem
+# with XFS project quotas (mounted with prjquota). `mcu-admin pool add`
+# manages pools afterwards. Without it, everything lives in the homes, under
+# home_quota.
+# projects_dir = "/srv/mcu/projects"
+# home_quota = "5g"
+
+# Shared volumes (a project fills one, others read it).
+# volumes_dir = "/srv/mcu/volumes"
+
+# A pool's disk type (ssd or hdd), for the Benchfile's `media =`. Default:
+# read from the kernel (rotational).
+# [media]
+# data = "ssd"
+# hdd = "hdd"
+
+# What any project may ask for, with no admin step; above it, refused. The
+# dashboard and `mcu-admin envelope set` change these lines here (a backup
+# kept); `mcu-admin envelope reset <key>` removes one, back to its default.
+[envelope]
+# default_disk = "10g"        # a new project's quota, until it sets its own
+# max_disk_ssd = "60g"        # the most a project may give itself on ssd pools
+# max_disk_hdd = "0"          # the same on hdd pools; 0: only the admin gives room there
+# max_volumes = 4             # shared volumes one project may own
+# max_cores = 5               # threads one job may request (default: half the jobs' threads)
+# build_cores = 4             # threads an image build gets (default: 4, at most the jobs' threads)
+# max_jobs = 2                # one project's jobs running at the same time
+# memory = "6g"               # the most one job may declare (default: half the jobs' memory)
+# jobs_memory = "12g"         # the memory all jobs share (default: the machine's minus reserved_memory)
+# exclusive = ["machine", "disk", "gpu"]   # held by one job at a time (gpu only when a GPU is found)
+# network = "fetch"           # none | fetch (prefetch, provisioning) | full
+# resources = ["render", "gpu"]   # the [resources] a job may ask for (default: those found)
+# timeout_max = "3h"
+# retention_days = 14         # how long job results are kept
+
+# The box's hardware, by name. Projects ask for names (resources =
+# ["render"]) and never see a device path. Each job gets only the devices of
+# what it asked for, resolved when it starts (`mcu-job box topology` shows
+# what is behind each name). Default, with no [resources] table: what the
+# machine has, a "render" node from an integrated GPU (Intel or AMD) and a
+# "gpu" when an NVIDIA GPU is found. Declare them to name them, to describe
+# them, or to keep a GPU that can be unplugged (an eGPU: absent, its jobs get
+# exit 75).
+#
+# [resources.render]
+# about = "Intel iGPU render node: compositors, GL, Vulkan, OpenCL"
+# drm = { driver = ["i915", "xe"] }
+# share = "shared"
+# provides = ["opengl", "vulkan"]
+#
+# [resources.gpu]
+# about = "NVIDIA GPU through CDI"
+# cdi = "nvidia.com/gpu=all"
+# probe = "nvidia"
+# share = "exclusive"
+# provides = ["cuda", "vulkan", "opencl", "opengl"]

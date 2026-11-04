@@ -1,0 +1,9 @@
+__pycache__/
+# what belongs to one machine stays out of git: real ceilings, volumes,
+# the box settings and the client host (the *.example files are templates)
+*.local.toml
+.env.local
+__pycache__/
+.aiball-session_id
+build/
+mcu-*.tar.gz

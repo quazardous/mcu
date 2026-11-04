@@ -1,0 +1,1597 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Root helper for the projects' self-service, the only thing they may run
+through sudo (sudoers: %mcu may run this file, nothing else). The project
+is the calling user (SUDO_USER = mcu-<project>), never an argument, and
+every request is checked against the box's envelope (/etc/mcu/box.toml).
+
+    sudo mcu-helper quota <size>                  set the project's disk quota
+    sudo mcu-helper volume-create <name> [reader...]
+    sudo mcu-helper volume-readers <name> [reader...]
+    sudo mcu-helper sftp                          the project's read-only view, over sftp (mcu-job)
+    mcu-helper usage [--parts]                    write usage.json; --parts (the root
+                                                    timer) measures what reclaim/purge free
+"""
+
+import fcntl
+import grp
+import json
+import os
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mcuconf  # noqa: E402  the box's configuration: defaults, then box.toml
+from hw import cpufreq, egpu, rapl, smart as hw_smart  # noqa: E402  the optional hardware, one module per feature
+
+ETC = Path("/etc/mcu")
+STATE = Path("/var/lib/mcu")
+VOLUMES = Path(mcuconf.load()["volumes_dir"])
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}\Z")
+
+
+def project_caller():
+    """whether an mcu project user called through sudo (mcu-web, the
+    dashboard, is the admin's side, not a project)"""
+    u = os.environ.get("SUDO_USER", "")
+    return u.startswith("mcu-") and u != "mcu-web"
+
+
+def die(msg):
+    print(f"mcu-helper: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def envelope():
+    """the envelope in force (mcuconf: defaults, box.toml, the admin's overrides)"""
+    return mcuconf.load()["envelope"]
+
+
+def box_conf():
+    return mcuconf.load()
+
+
+def pools():
+    """the box's storage pools: {name: path} and the default's name, from
+    pools.json (mcu-admin pool), seeded from box.toml projects_dir"""
+    try:
+        data = json.loads((STATE / "pools.json").read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not data.get("pools") and box_conf().get("projects_dir"):
+        data = {"pools": {"data": {"path": box_conf()["projects_dir"]}}, "default": "data"}
+    data.setdefault("pools", {})
+    return data
+
+
+def pool_media(name):
+    """a pool's disk type, ssd or hdd: pools.json's "media", or
+    box.toml [media] <pool> = "hdd", else what the kernel says of the disk
+    under it (rotational), through LVM and partitions"""
+    spec = pools()["pools"].get(name, {})
+    media = spec.get("media") or (box_conf().get("media") or {}).get(name)
+    if media in ("ssd", "hdd"):
+        return media
+    src = subprocess.run(["findmnt", "-no", "SOURCE", "--target", spec.get("path", "/")],
+                         capture_output=True, text=True).stdout.strip()
+    rota = subprocess.run(["lsblk", "-s", "-no", "ROTA", src], capture_output=True, text=True).stdout.split() if src else []
+    return "hdd" if rota and rota[-1] == "1" else "ssd"
+
+
+def project_pool(project):
+    """the pool a project lives on (its settings), else the default"""
+    try:
+        conf = json.loads((STATE / "projects" / f"{project}.json").read_text())
+    except (OSError, ValueError):
+        conf = {}
+    ps = pools()
+    name = conf.get("pool") or ps.get("default")
+    return name if name in ps["pools"] else None
+
+
+def projects_dir(project=None):
+    """the data filesystem a project's tree is on (its pool), or None:
+    everything in the homes"""
+    ps = pools()
+    name = project_pool(project) if project else ps.get("default")
+    return Path(ps["pools"][name]["path"]) if name in ps["pools"] else None
+
+
+def pool_check(path):
+    """what the box needs of a pool: a mounted filesystem with project
+    quotas enforced; with its device, size and free space"""
+    out = {"ok": False}
+    if path == ONROOT and not os.path.isdir(path):
+        os.makedirs(path, mode=0o755, exist_ok=True)
+    if not os.path.isdir(path):
+        out["error"] = "no such directory"
+        return out
+    mnt = mount_of(path)
+    try:
+        st = os.statvfs(path)
+        out.update(size=st.f_blocks * st.f_frsize, free=st.f_bavail * st.f_frsize, mount=mnt)
+    except OSError as e:
+        out["error"] = str(e)
+        return out
+    dev = subprocess.run(["findmnt", "-no", "SOURCE,FSTYPE", "--target", path], capture_output=True, text=True).stdout.split()
+    out["device"], out["fstype"] = (dev + ["?", "?"])[:2]
+    def enforced(kind):
+        st = probe(["xfs_quota", "-x", "-c", f"state -{kind}", mnt])
+        return "Enforcement: ON" in st
+    out["prjquota"] = enforced("p")
+    out["system"] = mnt == "/"
+    # a project quota polices a tree; on the system's filesystem, the user
+    # quota does (each project is its own user; it counts its home there too)
+    if out["prjquota"]:
+        out.update(ok=True, method="project")
+    elif out["system"] and enforced("u"):
+        out.update(ok=True, method="user")
+    elif out["system"]:
+        out["error"] = "the system disk without user quotas (mount / with uquota)"
+    else:
+        out["error"] = "project quotas are not enforced there (mount it with prjquota)"
+    return out
+
+
+def probe(cmd):
+    """a read-only probe's output, "" when its tool is not installed (lvm2,
+    smartmontools and xfsprogs are optional: a box without them still runs)"""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return ""
+
+
+SYSTEM_MOUNTS = ("/", "/boot", "/boot/efi", "/usr", "/var", "/home", "/tmp")
+ONROOT = "/srv/mcu/onroot"   # where projects' trees go on the system's filesystem
+
+
+def disks():
+    """what the machine really has, read only: mounted filesystems that could
+    hold projects (with whether project quotas are on), free space in LVM
+    volume groups, and disks with no partition; the system's own mounts are
+    never offered"""
+    out = {"filesystems": [], "system": [], "vg_free": [], "blank_disks": []}
+    try:
+        tree = json.loads(subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS"],
+                                         capture_output=True, text=True).stdout)["blockdevices"]
+    except (ValueError, KeyError):
+        tree = []
+    root_dev = None
+
+    def walk(devs, top=None):
+        for d in devs:
+            kids = d.get("children") or []
+            mps = [m for m in (d.get("mountpoints") or []) if m and m != "[SWAP]"]
+            if d["type"] == "disk" and not kids and not d.get("fstype") and d["size"] > 2**30:
+                out["blank_disks"].append({"device": d["path"], "size": d["size"]})
+            seen = set()
+            for m in mps:
+                # a bind mount of the same device (like /var/tmp on /) is not
+                # a partition of its own: count each device once, by its root
+                if d["path"] in seen:
+                    continue
+                if m != "/" and d["path"] == root_dev:
+                    continue
+                seen.add(d["path"])
+                if m == "/":
+                    # the system's filesystem: offered with a budget that
+                    # starts at 0, policed by user quotas, trees in ONROOT
+                    c = pool_check(m)
+                    out["filesystems"].append({"mount": ONROOT, "device": d["path"], "fstype": d.get("fstype"),
+                                               "size": c.get("size", d["size"]), "free": c.get("free"),
+                                               "prjquota": False, "usable": c["ok"], "why": c.get("error"),
+                                               "system": True, "method": c.get("method")})
+                    continue
+                if m in SYSTEM_MOUNTS or m.startswith("/boot"):
+                    # shown, not offered: the system's own filesystems
+                    try:
+                        st = os.statvfs(m)
+                        out["system"].append({"mount": m, "device": d["path"], "fstype": d.get("fstype"),
+                                              "size": st.f_blocks * st.f_frsize, "free": st.f_bavail * st.f_frsize})
+                    except OSError:
+                        pass
+                    continue
+                if d.get("fstype") not in ("xfs", "ext4"):
+                    continue
+                c = pool_check(m)
+                out["filesystems"].append({"mount": m, "device": d["path"], "fstype": d["fstype"],
+                                           "size": c.get("size", d["size"]), "free": c.get("free"),
+                                           "prjquota": c.get("prjquota", False), "usable": c["ok"],
+                                           "why": c.get("error")})
+            walk(kids, top or d)
+    root_dev = subprocess.run(["findmnt", "-no", "SOURCE", "/"], capture_output=True, text=True).stdout.strip()
+    walk(tree)
+    vgs = probe(["vgs", "--units", "b", "--noheadings", "--nosuffix", "-o", "vg_name,vg_free"])
+    for line in vgs.splitlines():
+        f = line.split()
+        if len(f) == 2 and int(f[1]) > 2**30:
+            out["vg_free"].append({"vg": f[0], "free": int(f[1])})
+    return out
+
+
+def mount_of(path):
+    """the mount point holding `path`: what xfs_quota wants"""
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def tree(project):
+    """a project's own tree on its pool: images, storage, results and build
+    scratch, under one XFS project quota (the project's uid)"""
+    pd = projects_dir(project)
+    return pd / project if pd else Path("/nonexistent")
+
+
+# ---------------------------------------------------------------- units
+# A project's storage is made of units, each living on a pool of its own:
+# storage/<name> (its [storage] and the [checkout] git cache), images (podman's
+# storage), results (its jobs) and volume/<name> (shared volumes it owns). A
+# unit's place is where its link in the home resolves to.
+
+def home_of(project):
+    return Path(pwd.getpwnam(f"mcu-{project}").pw_dir)
+
+
+def project_roots(project):
+    """the real paths a project's data may live under: its home, and its
+    directory on each pool"""
+    roots = [os.path.realpath(home_of(project))]
+    for spec in pools()["pools"].values():
+        roots.append(os.path.realpath(os.path.join(spec["path"], project)))
+    return roots
+
+
+def inside_project(project, path, extra=()):
+    """the path, links resolved, stays in the project's own trees (or one of
+    extra): root never follows a link or a setting the project could have
+    pointed at someone else's data or the system"""
+    real = os.path.realpath(path)
+    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in [*project_roots(project), *extra])
+
+
+def graphroot(project):
+    home = home_of(project)
+    conf = home / ".config/containers/storage.conf"
+    if conf.exists():
+        m = re.search(r'graphroot\s*=\s*"([^"]+)"', conf.read_text())
+        # the file is the project's: a path outside its trees is not taken
+        if m and inside_project(project, m.group(1)):
+            return Path(m.group(1))
+    return home / ".local/share/containers/storage"
+
+
+def link_of(project, unit):
+    """the stable path a unit is reached by (what jobs and podman use)"""
+    kind, _, name = unit.partition("/")
+    home = home_of(project)
+    return {"storage": home / "cache" / name, "results": home / "jobs",
+            "images": graphroot(project), "volume": VOLUMES / name}[kind]
+
+
+def unit_dest(project, unit, pool_name):
+    """where a unit goes on a pool"""
+    base = Path(pools()["pools"][pool_name]["path"]) / project
+    kind, _, name = unit.partition("/")
+    return {"storage": base / "cache" / name, "results": base / "jobs", "scratch": base / "scratch",
+            "images": base / "containers", "volume": base / "volumes" / name}[kind]
+
+
+def pool_of_path(path):
+    """the pool a real path is on, or `home` (the project's home on /)"""
+    real = os.path.realpath(path)
+    best = None
+    for name, spec in pools()["pools"].items():
+        pp = os.path.realpath(spec["path"])
+        if real == pp or real.startswith(pp + "/"):
+            if best is None or len(pp) > len(os.path.realpath(pools()["pools"][best]["path"])):
+                best = name
+    return best or "home"
+
+
+def units_of(project, sizes=True):
+    """every unit of the project, with its kind, pool, filesystem and size
+    (sizes=False skips the du, for callers that only need where they live)"""
+    home = home_of(project)
+    out = []
+    cache = home / "cache"
+    for c in sorted(cache.iterdir()) if cache.exists() else []:
+        if c.is_dir():
+            kind = "git cache" if c.name == ".git" else ("tmp storage" if (c / ".bench-tmp").exists() else "storage")
+            # its stated end, as its last mount wrote it (the storage's, or a sub's)
+            life = None
+            # (in home/.mcu-life, outside the storage; an older box kept it inside)
+            records = [home / ".mcu-life" / f"{c.name}.json", *sorted((home / ".mcu-life").glob(f"{c.name}~*.json")),
+                       c / ".bench-life", *sorted(c.glob("*/.bench-life"))]
+            for f in records if c.name != ".git" else []:
+                try:
+                    life = json.loads(f.read_text()).get("life")
+                    break
+                except (OSError, ValueError):
+                    pass
+            out.append({"unit": f"storage/{c.name}", "kind": kind, "path": str(c), "life": life})
+    g = graphroot(project)
+    out.append({"unit": "images", "kind": "images", "path": str(g)})
+    out.append({"unit": "results", "kind": "results", "path": str(home / "jobs")})
+    for vp in (STATE / "volumes").glob("*.json"):
+        try:
+            if json.loads(vp.read_text()).get("owner") == project:
+                out.append({"unit": f"volume/{vp.stem}", "kind": "shared volume", "path": str(VOLUMES / vp.stem)})
+        except ValueError:
+            pass
+    for u in out:
+        u["pool"] = pool_of_path(u["path"]) if os.path.exists(u["path"]) else "home"
+        u["bytes"] = du(u["path"]) if sizes and os.path.exists(u["path"]) else 0
+        u["fs"] = mount_of(u["path"]) if os.path.exists(u["path"]) else "/"
+    return out
+
+
+def quota_kind(mnt):
+    """project (XFS project quotas) or user, how a filesystem polices"""
+    st = subprocess.run(["xfs_quota", "-x", "-c", "state -p", mnt], capture_output=True, text=True).stdout
+    return "project" if "Enforcement: ON" in st else "user"
+
+
+def fs_used(project, user, mnt):
+    kind = quota_kind(mnt)
+    who = f"-p -b -N {pwd.getpwnam(user).pw_uid}" if kind == "project" else f"-u -b -N {user}"
+    out = subprocess.run(["xfs_quota", "-x", "-c", f"quota {who}", mnt], capture_output=True, text=True).stdout.split()
+    return int(out[1]) * 1024 if len(out) > 1 and out[1].isdigit() else 0
+
+
+ROOT_SLACK_KB = 64 * 1024   # room on / beyond a full quota, for the box's state files
+
+
+def spread(project, user, conf, units=None):
+    """a quota per pool type: on each filesystem of a type the project uses
+    (its units' filesystems; / for ssd, where its home is), its quota there
+    is what it already holds there plus its room left on that type,
+    recomputed by the usage timer, after jobs and after moves"""
+    units = units if units is not None else units_of(project)
+    uid = pwd.getpwnam(user).pw_uid
+    out = {}
+    for media, mounts in mounts_by_media(project, units).items():
+        if not mounts:
+            continue
+        used = {m: fs_used(project, user, m) for m in mounts}
+        left = max(effective(conf, media) - sum(used.values()), 0)
+        for m in mounts:
+            kb = max((used[m] + left) // 1024, 1024)
+            if m == "/":
+                # / holds the box's own state (state.json, memory.json…),
+                # owned by whichever runner wrote it last: a project with a
+                # full quota keeps room there, or the scheduler stops for all
+                kb = max(kb, used[m] // 1024 + ROOT_SLACK_KB)
+            who = f"-p bsoft={kb}k bhard={kb}k {uid}" if quota_kind(m) == "project" else f"-u bsoft={kb}k bhard={kb}k {user}"
+            subprocess.run(["xfs_quota", "-x", "-c", f"limit {who}", m], check=True)
+        out[media] = sum(used.values())
+    return out
+
+
+def set_quota(project, user, conf):
+    spread(project, user, conf)
+
+
+def used_by(project, user):
+    """bytes the project holds, over every filesystem it uses"""
+    return sum(fs_used(project, user, m) for m in {"/"} | {u["fs"] for u in units_of(project)})
+
+
+def make_unit_dir(project, path):
+    """a unit's directory on a pool: the project's, labelled for containers,
+    with its project id where the filesystem has project quotas"""
+    user = f"mcu-{project}"
+    pw = pwd.getpwnam(user)
+    # the parents are the project's: a link among them must not lead root
+    # to create or chown anything outside its trees
+    existing = next(d for d in [path, *path.parents] if d.exists())
+    pool_roots = {os.path.realpath(spec["path"]) for spec in pools()["pools"].values()}
+    if os.path.realpath(existing) not in pool_roots and not inside_project(project, existing):
+        die(f"{path} leads outside {project}'s trees; nothing done")
+    path.mkdir(parents=True, exist_ok=True)
+    if not inside_project(project, path):
+        die(f"{path} leads outside {project}'s trees; nothing done")
+    for d in [path, *path.parents]:
+        if d.name == project:
+            break
+        os.chown(d, pw.pw_uid, pw.pw_gid)
+    root = next((d for d in path.parents if d.name == project), path.parent)
+    os.chown(root, pw.pw_uid, pw.pw_gid)
+    mnt = mount_of(path)
+    if quota_kind(mnt) == "project":
+        subprocess.run(["xfs_quota", "-x", "-c", f"project -s -p {path} {pw.pw_uid}", mnt],
+                       check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["chcon", "-R", "-t", "container_file_t", str(path)], capture_output=True)
+
+
+def pick_pool_for(project, nbytes=2**30, media=None):
+    """the pool a new unit of the project goes to: its default pool when it
+    has budget room, else the pool with the most; with a media (ssd, hdd),
+    only the pools of that type; None without such a pool"""
+    ps = pools()
+    try:
+        conf = json.loads((STATE / "projects" / f"{project}.json").read_text())
+    except (OSError, ValueError):
+        conf = {}
+    try:
+        usage = json.loads((STATE / "usage.json").read_text())
+    except (OSError, ValueError):
+        usage = {}
+    def room(name):
+        try:
+            v = os.statvfs(ps["pools"][name]["path"])
+        except OSError:
+            return -1
+        budget = ps["pools"][name].get("budget", v.f_blocks * v.f_frsize)
+        if not budget:
+            return -1
+        promised = usage.get("_pools", {}).get(name, {}).get("quotas", 0)
+        return min(budget - promised, v.f_bavail * v.f_frsize)
+    if media == "hdd" and not effective(conf, "hdd"):
+        return None                 # no room on hdd for this project (its hdd quota is 0)
+    names = [n for n in ps["pools"] if media is None or pool_media(n) == media]
+    pref = conf.get("pool") or ps.get("default")
+    if pref in names and room(pref) > nbytes:
+        return pref
+    best = max(names, key=room, default=None)
+    return best if best and room(best) > nbytes else None
+
+
+def place_unit(project, user, unit, media=None):
+    """a new unit (a storage the project mounts for the first time, its
+    images before the first build, the scratch space of jobs that ask for a
+    disk type): the box picks its pool, makes its directory and prints it;
+    nothing printed: it stays in the home. media: "hdd" or "ssd" prefers a
+    pool of that type (else the usual one); "hdd!" or "ssd!" insists: exit 3
+    when the box has none"""
+    if not re.fullmatch(r"(storage/[A-Za-z0-9._-]{1,64}|images|results|scratch)", unit):
+        die("bad unit")
+    if media is not None and media not in ("ssd", "hdd", "ssd!", "hdd!"):
+        die("bad media (ssd, hdd, ssd!, hdd!)")
+    pool = None
+    if media:
+        pool = pick_pool_for(project, media=media.rstrip("!"))
+        if not pool and media.endswith("!"):
+            print(f"mcu-helper: {no_room_why(project, media.rstrip('!'))}", file=sys.stderr)
+            sys.exit(3)
+    if not pool and unit != "scratch":
+        pool = pick_pool_for(project)
+    if not pool:
+        return
+    dest = unit_dest(project, unit, pool)
+    make_unit_dir(project, dest)
+    print(dest)
+
+
+def no_room_why(project, media):
+    """why a unit can't go on that pool type: no such pool, or no quota there"""
+    try:
+        conf = json.loads((STATE / "projects" / f"{project}.json").read_text())
+    except (OSError, ValueError):
+        conf = {}
+    if not any(pool_media(n) == media for n in pools()["pools"]):
+        return f"this box has no {media} pool"
+    if not effective(conf, media):
+        return f"{project} has no {media} quota (config disk {media} <size>, or ask the admin)"
+    return f"no {media} pool with room on this box"
+
+
+def place_media(project, unit, media):
+    """a project's storage or volume whose Benchfile asks for a disk type it
+    is not on: queue its move (an admin task, waited for and cancellable
+    like any move) to a pool of that type; says what it did"""
+    if not re.fullmatch(r"(storage/[A-Za-z0-9._-]{1,64}|volume/[a-z][a-z0-9-]{0,30})", unit) \
+            or media not in ("ssd", "hdd", "ssd!", "hdd!"):
+        die("usage: place-media storage/<name>|volume/<name> ssd|hdd[!]")
+    want = media.rstrip("!")
+    path = link_of(project, unit)
+    if unit.startswith("volume/"):
+        try:
+            if json.loads((STATE / "volumes" / f"{unit[7:]}.json").read_text()).get("owner") != project:
+                die(f"{project} does not own {unit}")
+        except (OSError, ValueError):
+            die(f"no {unit}")
+    if not os.path.exists(path):
+        print(f"mcu-helper: {unit}: not created yet; it is placed on {want} when first used")
+        return
+    here = pool_of_path(path)
+    if here != "home" and pool_media(here) == want:
+        print(f"mcu-helper: {unit}: already on {want} (pool {here})")
+        return
+    pool = pick_pool_for(project, nbytes=du(path) + 2**30, media=want)
+    if not pool:
+        if media.endswith("!"):
+            die(f"{unit}: {no_room_why(project, want)}")
+        print(f"mcu-helper: {unit}: {no_room_why(project, want)}; it stays where it is")
+        return
+    r = subprocess.run(["/usr/bin/python3", str(Path(__file__).resolve().parent / "mcu-task"),
+                        "add", "migrate", project, unit, pool], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"mcu-helper: {unit}: {(r.stderr or r.stdout).strip()}")
+        return
+    print(f"mcu-helper: {unit}: move to {want} (pool {pool}) queued as task {r.stdout.strip()}; "
+          "jobs using it wait for the move")
+
+
+def uses_unit(e, project, unit):
+    """does a scheduler entry use the unit: a storage by the jobs mounting
+    it, images and results by any job or build of the project, a shared
+    volume by any job mounting it"""
+    uses = e.get("units")
+    if unit.startswith("volume/"):
+        return unit in (uses or [])
+    if e["project"] != project:
+        return False
+    if unit in ("images", "results"):
+        return True
+    return uses is None or unit in uses   # an older runner: assume it does
+
+
+def unit_busy(project, unit, running_only=False):
+    """the jobs that use the unit: running and queued; with running_only,
+    the queued ones that will wait for a move (honors_moves) are left out"""
+    try:
+        sched = json.loads((STATE / "state.json").read_text())
+    except (OSError, ValueError):
+        sched = {}
+    # a queued runner older than the "moving" list would not wait for a
+    # move: it counts as busy too
+    # results: a queued job already has its job directory open, so they
+    # wait for the queue too
+    drain = running_only and unit != "results"
+    queue = [e for e in sched.get("queue", []) if not (drain and e.get("honors_moves"))]
+    entries = sched.get("running", []) + queue
+    return [f"{e['project']}/{e['job']}" for e in entries if uses_unit(e, project, unit)]
+
+
+def sched_edit(fn):
+    """change state.json under the scheduler's lock (mcu.py's Scheduler)"""
+    with open(STATE / "sched.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = STATE / "state.json"
+        text = path.read_text() if path.exists() else ""
+        state = json.loads(text) if text.strip() else {}
+        fn(state)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1))
+        os.chmod(tmp, 0o664)
+        os.chown(tmp, -1, grp.getgrnam("mcu").gr_gid)
+        os.replace(tmp, path)
+
+
+def move_unit(project, unit, pool):
+    """root (mcu-admin migrate, an admin task): move one unit to a pool.
+    The move is announced to the scheduler first (state.json "moving"): no
+    job using the unit starts from then on, the running ones are waited for,
+    then the unit moves. Storage, results and volumes are copied, images
+    dropped (the next job rebuilds them); the quota spread and the usage
+    measure are redone at once. SIGTERM while waiting (a cancelled task)
+    withdraws the move."""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    if not project_exists(project):
+        die(f"no project {project}")
+    if pool not in pools()["pools"]:
+        die(f"no pool {pool}")
+    if not any(u["unit"] == unit for u in units_of(project)):
+        die(f"{project} has no unit {unit} (see mcu-helper units {project})")
+    link = link_of(project, unit)
+    if Path(os.path.realpath(link)) == unit_dest(project, unit, pool):
+        die(f"{unit} of {project} is already on {pool}")
+
+    def withdraw(*_):
+        raise SystemExit(f"mcu-helper: move of {unit} withdrawn")
+    signal.signal(signal.SIGTERM, withdraw)
+    me = {"project": project, "unit": unit, "pool": pool, "pid": os.getpid(), "since": time.time()}
+    sched_edit(lambda st: st.setdefault("moving", []).append(me))
+    try:
+        said = None
+        while busy := unit_busy(project, unit, running_only=True):
+            if busy != said:
+                print(f"waiting: {unit} in use by {', '.join(busy)}; new jobs using it wait for the move", flush=True)
+                said = busy
+            time.sleep(3)
+        # one copy at a time on the box, whatever the project
+        with open("/run/lock/mcu-move.lock", "a") as copy_lock:
+            try:
+                fcntl.flock(copy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("waiting: another move is copying", flush=True)
+                fcntl.flock(copy_lock, fcntl.LOCK_EX)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            print(f"progress: moving {unit}", flush=True)
+            move_now(project, unit, pool, link)
+    finally:
+        sched_edit(lambda st: st.update(moving=[m for m in st.get("moving", []) if m.get("pid") != me["pid"]]))
+    usage()
+
+
+def move_now(project, unit, pool, link):
+    """the move itself, once nothing uses the unit"""
+    user = f"mcu-{project}"
+    src = Path(os.path.realpath(link))
+    # the link is the project's: copied, then removed, only inside its trees
+    own_volume = [os.path.realpath(VOLUMES / unit.partition("/")[2])] if unit.startswith("volume/") else []
+    if src.exists() and not inside_project(project, src, own_volume):
+        die(f"{unit} of {project} points outside its trees ({src}); nothing moved")
+    dest = unit_dest(project, unit, pool)
+    size = du(src) if src.exists() else 0
+    free = os.statvfs(pools()["pools"][pool]["path"]).f_bavail * os.statvfs(pools()["pools"][pool]["path"]).f_frsize
+    if size > free - 2**30:
+        die(f"{pool} has {free / 2**30:.1f} GB free, {unit} needs {size / 2**30:.1f}")
+    pw = pwd.getpwnam(user)
+    print(f"progress: {unit} ({size / 2**30:.2f} GB) from {pool_of_path(src)} to {pool}", flush=True)
+    if unit == "images":
+        uid = pw.pw_uid
+        subprocess.run(["runuser", "-u", user, "--", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"HOME={pw.pw_dir}",
+                        "bash", "-c", "cd /tmp; podman system reset -f >/dev/null 2>&1"], capture_output=True)
+        make_unit_dir(project, dest)
+        tmp = dest.parent / "tmp"
+        make_unit_dir(project, tmp)
+        conf = Path(pw.pw_dir) / ".config/containers/storage.conf"
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(f'[storage]\ndriver = "overlay"\ngraphroot = "{dest}"\n')
+        for x in (conf.parent.parent, conf.parent, conf):
+            os.chown(x, pw.pw_uid, pw.pw_gid)
+        if src.exists() and src != dest:
+            subprocess.run(["rm", "-rf", str(src)])
+        print("progress: images dropped; the next job rebuilds them", flush=True)
+    else:
+        make_unit_dir(project, dest)
+        if src.exists():
+            r = subprocess.run(["rsync", "-aHAX", "--info=progress2", f"{src}/", f"{dest}/"])
+            # 24: files deleted while they were copied (a cache cleaning
+            # itself); what exists was copied, the move goes on
+            if r.returncode == 24:
+                print("progress: some files went away during the copy (deleted meanwhile); the rest is copied", flush=True)
+            elif r.returncode != 0:
+                die(f"copy failed (rsync {r.returncode}); {unit} stays where it was")
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            subprocess.run(["rm", "-rf", str(link)], check=True)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(dest)
+        if not unit.startswith("volume/"):
+            os.lchown(link, pw.pw_uid, pw.pw_gid)
+        if src.exists() and src != dest and not str(src).startswith(str(link)):
+            subprocess.run(["rm", "-rf", str(src)])
+        subprocess.run(["chcon", "-R", "-t", "container_file_t", str(dest)], capture_output=True)
+        print(f"progress: {unit} switched to {dest}", flush=True)
+    conf_path = STATE / "projects" / f"{project}.json"
+    conf = json.loads(conf_path.read_text())
+    spread(project, user, conf)
+    conf["purged"] = {"at": time.time(), "level": "move", "parts": f"{unit} to {pool}", "freed": 0, "reason": None}
+    conf_path.write_text(json.dumps(conf, indent=1) + "\n")
+    print(f"mcu-helper: {unit} of {project} moved to {pool} ({dest})")
+
+
+# ---------------------------------------------------------- restart, power off
+
+SHUTDOWN = STATE / "shutdown.json"
+ADMIN_CMD = "/usr/local/lib/mcu/mcu-admin"
+TASK_CMD = "/usr/local/lib/mcu/mcu-task"
+
+
+def shutdown_save(st):
+    tmp = SHUTDOWN.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, SHUTDOWN)
+    with open(STATE / "events.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"kind": "box", "shutdown": st.get("step"), "t": time.time()}) + "\n")
+
+
+def shutdown_run(action):
+    """root, as a mcu-task task (mcu-admin shutdown reboot|poweroff): the
+    graceful restart or power-off. The queue closes, the eGPU is ejected,
+    the running jobs end, a 60 s countdown, then systemctl. Each step prints
+    `waiting:` so the task stays cancellable; a cancel (SIGTERM) undoes what
+    this sequence did: it reopens the queue it closed and re-attaches the
+    GPU it ejected. shutdown.json tells the dashboard (and the next boot,
+    which reopens the queue)"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    # test: the whole sequence and its countdown, without the systemctl
+    if action not in ("reboot", "poweroff", "test"):
+        die("restart: reboot, poweroff or test")
+    word = {"reboot": "restart", "poweroff": "power-off", "test": "test restart"}[action]
+    st = {"action": action, "at": time.time(), "step": "closing", "closed_queue": False, "ejected": False,
+          "deadline": None, "running": []}
+
+    def undo(*_):
+        if st["closed_queue"]:
+            subprocess.run([ADMIN_CMD, "queue", "open", "--if-by", "shutdown"], capture_output=True)
+        if st["ejected"]:
+            subprocess.run([TASK_CMD, "add", "gpu", "attach"], capture_output=True)
+        SHUTDOWN.unlink(missing_ok=True)
+        with open(STATE / "events.jsonl", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps({"kind": "box", "shutdown": "cancelled", "t": time.time()}) + "\n")
+        print(f"mcu-helper: {word} cancelled", flush=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, undo)
+    shutdown_save(st)
+
+    print("waiting: closing the queue", flush=True)
+    if json.loads((STATE / "queue.json").read_text() if (STATE / "queue.json").exists() else "{}").get("mode") != "closed":
+        reason = {"reboot": "box restarting (admin), expected back in a few minutes",
+                  "poweroff": "box powering off (admin)",
+                  "test": "admin testing the restart sequence (no restart), back in a few minutes"}[action]
+        args = [ADMIN_CMD, "queue", "close", reason, "--by", "shutdown"] + (["--until", "+10m"] if action != "poweroff" else [])
+        if subprocess.run(args, capture_output=True).returncode == 0:
+            st["closed_queue"] = True
+
+    if json.loads((STATE / "resources.json").read_text() or "{}").get("gpu") is True and gpu_state() is None:
+        st["step"] = "ejecting"
+        shutdown_save(st)
+        print("waiting: ejecting the eGPU (its running jobs first)", flush=True)
+        r = subprocess.run([TASK_CMD, "add", "gpu", "eject"], capture_output=True, text=True)
+        tid = r.stdout.strip()
+        while tid:
+            try:
+                t = json.loads((STATE / "tasks" / f"{tid}.json").read_text())
+            except (OSError, ValueError):
+                break
+            if t["state"] in ("done", "failed", "cancelled", "interrupted"):
+                st["ejected"] = t["state"] == "done"
+                break
+            time.sleep(2)
+
+    st["step"] = "waiting"
+    said = None
+    while True:
+        try:
+            running = json.loads((STATE / "state.json").read_text()).get("running", [])
+        except (OSError, ValueError):
+            running = []
+        names = [f"{r['project']}/{r['job']}" for r in running]
+        if not names:
+            break
+        if names != said:
+            st["running"] = names
+            shutdown_save(st)
+            print(f"waiting: {len(names)} running job(s): {', '.join(names)}", flush=True)
+            said = names
+        time.sleep(3)
+
+    st.update(step="countdown", running=[], deadline=time.time() + 60)
+    shutdown_save(st)
+    while (left := st["deadline"] - time.time()) > 0:
+        print(f"waiting: {word} in {int(left)} s", flush=True)
+        time.sleep(min(5, left))
+    # past here it can no longer be cancelled: what runs now is the stop
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    st["step"] = action
+    shutdown_save(st)
+    print(f"progress: {word} now", flush=True)
+    if action == "test":
+        print("mcu-helper: test: no restart; undoing", flush=True)
+        undo()
+    subprocess.run(["systemctl", action])
+
+
+# ---------------------------------------------------------------- the eGPU
+
+def gpu_refresh(why):
+    """the collector's GPU-only pass, as its own user: resources.json and
+    the dashboard learn the new state at once"""
+    subprocess.run(["runuser", "-u", "mcu-web", "--", "/usr/bin/python3",
+                    str(Path(__file__).resolve().parent / "collect.py"), "gpu", why], capture_output=True)
+
+
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def gpu_set(state, note=None):
+    """gpu.json, the eGPU's state as the admin or an event left it:
+    ejecting, ejected, or lost (gone without an eject); tied to this boot,
+    the readers ignore one from an earlier boot"""
+    path = STATE / "gpu.json"
+    if state is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_text(json.dumps({"state": state, "at": time.time(), "boot": boot_id(), "note": note}) + "\n")
+        os.chmod(path, 0o644)
+
+
+def gpu_state():
+    try:
+        g = json.loads((STATE / "gpu.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return g.get("state") if g.get("boot") in (None, boot_id()) else None
+
+
+def gpu_event(what):
+    """root, run by udev (through systemd-run) on the eGPU's events, so the
+    driver comes back on its own when the enclosure is plugged:
+      bind                the driver took the card: an eject or a loss is over
+      remove, unbind,     the card or its enclosure went: expected during an
+      thunderbolt-remove  eject, otherwise it was pulled without one (lost)
+      thunderbolt-add     the enclosure came: if it had been pulled without an
+                          eject and the driver doesn't take the card within
+                          20 s, reload the driver and rescan, unless an
+                          nvidia thread is stuck (then only a reboot helps)
+    Each step is logged (journal, tag mcu-egpu) and ends with the
+    collector's GPU pass, which tells the dashboard and the scheduler"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    log = lambda msg: subprocess.run(["logger", "-t", "mcu-egpu", f"{what}: {msg}"])
+    with open("/run/lock/mcu-egpu.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = gpu_state()
+        if state in ("ejecting", "attaching"):
+            pass                    # the admin's operation in progress owns the state; it ends it itself
+        elif what == "bind":
+            if state in ("ejected", "lost"):
+                gpu_set(None)
+                log(f"the driver has the card again ({state} cleared)")
+        elif what in ("remove", "unbind", "thunderbolt-remove"):
+            # the driver back on the card by now: a stale event (a reload's unbind)
+            if state not in ("ejected", "lost") and not egpu.bound():
+                gpu_set("lost", "unplugged without an eject")
+                log("the eGPU went without an eject")
+        elif what == "thunderbolt-add":
+            gpu_refresh(what)
+            if egpu.bound(wait=20):
+                if state in ("ejected", "lost"):
+                    gpu_set(None)
+                    log(f"the driver has the card again ({state} cleared)")
+            elif state != "lost":
+                log("the driver has not taken the card yet")   # at boot, or the card is slow: its bind will tell
+            else:
+                stuck = egpu.stuck()
+                if stuck:
+                    gpu_set("lost", egpu.FELL_OFF if egpu.fell_off_bus() else "an nvidia thread is stuck in the kernel: reboot the box")
+                    log(f"driver stuck ({'; '.join(stuck)}); not touching it, reboot needed")
+                else:
+                    log("the driver did not take the card in 20 s: reloading it")
+                    if egpu.unload(log):
+                        egpu.load()
+                    egpu.rescan()
+                    if egpu.bound(wait=20):
+                        gpu_set(None)
+                        log("the driver has the card again (after a reload)")
+                    else:
+                        gpu_set("lost", "the enclosure is back but the driver can't take the card: reboot the box")
+                        log("the driver still can't take the card, reboot needed")
+        gpu_refresh(what)
+
+
+def gpu_shutdown():
+    """root, at power-off (mcu-egpu-shutdown.service, after
+    amd-usb4-egpu-toolkit's shutdown-helper): let go of the eGPU before
+    systemd tears the Thunderbolt stack down, the cause of hung power-offs:
+    persistenced stopped, the nvidia modules unloaded within deadlines;
+    nothing at all when an nvidia thread is already stuck, since an unload
+    would hang with it"""
+    log = lambda msg: subprocess.run(["logger", "-t", "mcu-egpu-shutdown", msg])
+    stuck = egpu.stuck()
+    if stuck:
+        log(f"not unloading: nvidia thread(s) stuck in the kernel ({'; '.join(stuck)})")
+        return
+    if not re.search(r"^nvidia ", Path("/proc/modules").read_text(), re.M):
+        log("nvidia not loaded, nothing to do")
+        return
+    log("done" if egpu.unload(log) else "gave up, the rest of the power-off goes on")
+
+
+def nvidia_resources():
+    """the declared resources that are the hot-plug NVIDIA GPU"""
+    declared = box_conf().get("resources") or {"gpu": {"probe": "nvidia"}}
+    return {n for n, r in declared.items() if isinstance(r, dict) and r.get("probe") == "nvidia"}
+
+
+def gpu_users():
+    """running jobs on the GPU, and the processes holding /dev/nvidia*"""
+    try:
+        sched = json.loads((STATE / "state.json").read_text())
+    except (OSError, ValueError):
+        sched = {}
+    names = nvidia_resources()
+    jobs = [f"{e['project']}/{e['job']}" for e in sched.get("running", []) if names & set(e.get("exclusive", []))]
+    holders = set()
+    for fd in Path("/proc").glob("[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd).startswith("/dev/nvidia"):
+                pid = fd.parent.parent.name
+                holders.add(f"{(Path('/proc') / pid / 'comm').read_text().strip()}[{pid}]")
+        except OSError:
+            pass
+    return jobs, sorted(holders)
+
+
+def gpu_eject():
+    """root (mcu-admin gpu eject, an admin task): take the eGPU off the bus
+    so its enclosure can be unplugged. New GPU jobs are refused (exit 75)
+    from now on; the running ones are waited for (SIGTERM meanwhile, a
+    cancelled task, withdraws the eject). Then, as amd-usb4-egpu-toolkit's
+    egpu-eject: refused while a process holds the card or a driver thread
+    is stuck; nvidia-persistenced stopped; the PCI functions removed; the
+    Thunderbolt device de-authorized where the host allows it"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    if not egpu.functions():
+        gpu_set("ejected")
+        gpu_refresh("eject")
+        print("mcu-helper: no NVIDIA GPU on the bus; safe to unplug")
+        return
+
+    def withdraw(*_):
+        gpu_set(None)
+        gpu_refresh("eject withdrawn")
+        raise SystemExit("mcu-helper: eject withdrawn")
+    signal.signal(signal.SIGTERM, withdraw)
+    gpu_set("ejecting")
+    gpu_refresh("ejecting")
+    said = None
+    while True:
+        jobs, holders = gpu_users()
+        if not jobs:
+            break
+        if jobs != said:
+            print(f"waiting: the GPU is in use by {', '.join(jobs)}; new GPU jobs are refused meanwhile", flush=True)
+            said = jobs
+        time.sleep(3)
+    stuck = egpu.stuck()
+    if stuck:
+        gpu_set(None)
+        gpu_refresh("eject refused")
+        die(f"nvidia thread(s) stuck in the kernel ({'; '.join(stuck)}): do not unplug; reboot the box first")
+    if subprocess.run(["systemctl", "is-active", "--quiet", "nvidia-persistenced"]).returncode == 0:
+        subprocess.run(["systemctl", "stop", "nvidia-persistenced"])
+        print("progress: nvidia-persistenced stopped", flush=True)
+    _, holders = gpu_users()
+    if holders:
+        gpu_set(None)
+        gpu_refresh("eject refused")
+        die(f"the GPU is held by {', '.join(holders)}; stop them, then eject again")
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)   # past this point it goes to the end
+    for fn in egpu.functions():
+        egpu.remove([fn])
+        print(f"progress: {fn} removed from the PCI bus", flush=True)
+    gone = egpu.deauthorize()
+    note = (f"{', '.join(gone)} de-authorized" if gone
+            else "its Thunderbolt link stays authorized (this host does not allow de-authorizing)")
+    gpu_set("ejected")
+    gpu_refresh("eject")
+    print(f"mcu-helper: the eGPU is off the bus, safe to unplug ({note}); `mcu-admin gpu attach` brings it back")
+
+
+def gpu_pending(on):
+    """root (mcu-task, when an eject is queued or a queued one cancelled):
+    from the click on, new GPU jobs are refused (exit 75), even during the
+    eject's 10 s before it starts; running ones go on, and the eject waits
+    for them. Cancelled before it started: back as it was"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    with open("/run/lock/mcu-egpu.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = gpu_state()
+        if on and state is None:
+            gpu_set("ejecting")
+            gpu_refresh("eject queued")
+        elif not on and state == "ejecting":
+            gpu_set(None)
+            gpu_refresh("eject cancelled")
+
+
+def gpu_attach():
+    """root (mcu-admin gpu attach): undo an eject with the enclosure still
+    plugged in: re-authorize its Thunderbolt device, rescan the PCI bus,
+    wait for the driver"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    before = gpu_state()
+    gpu_set("attaching")
+    gpu_refresh("attaching")
+    for name in egpu.reauthorize():
+        print(f"progress: {name} re-authorized", flush=True)
+    # a port left suspended after the eject hides the card from a rescan
+    for name in egpu.wake_ports():
+        print(f"progress: woke the PCIe port {name}", flush=True)
+    time.sleep(1)
+    for attempt in (1, 2):
+        egpu.rescan()
+        print("progress: PCI bus rescanned", flush=True)
+        bound = egpu.bound(wait=10 if attempt == 1 else 20)
+        if bound:
+            break
+    gpu_set(None if bound else before)     # back to where it was when no card came
+    gpu_refresh("attach")
+    if not bound:
+        die("no NVIDIA GPU came back: check the enclosure's power and cable, or unplug and plug it again")
+    print("mcu-helper: the eGPU is back; GPU jobs are accepted again")
+
+
+def parse_size(value):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmgtKMGT]?)", str(value))
+    if not m:
+        die(f"bad size {value!r}")
+    return int(float(m.group(1)) * {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()])
+
+
+def caller():
+    user = os.environ.get("SUDO_USER", "")
+    if os.geteuid() != 0 or not user.startswith("mcu-") or user == "mcu-web":
+        die("run through sudo by an mcu project user")
+    project = user[len("mcu-"):]
+    if not (STATE / "projects" / f"{project}.json").exists():
+        die(f"no project {project}")
+    return project, user
+
+
+def project_exists(project):
+    return (STATE / "projects" / f"{project}.json").exists()
+
+
+SFTP_SERVER = "/usr/libexec/openssh/sftp-server"
+
+
+def sftp_view():
+    """the project's read-only view, for sshfs on its usual key (mcu-job
+    hands an sftp request here): in a mount namespace of this session only,
+    a tmpfs root shows storage/<name> (each storage, wherever its pool),
+    jobs/ (the results) and latest/<name> (the run each jobs/.latest link
+    names), read-only binds, with sftp-server and its libraries; then the
+    session is chrooted there and runs sftp-server -R as the project. The
+    mounts go with the session"""
+    project, user = caller()
+    pw = pwd.getpwnam(user)
+    os.unshare(os.CLONE_NEWNS)
+    subprocess.run(["mount", "--make-rprivate", "/"], check=True)
+    root = Path("/run/mcu-sftp")
+    root.mkdir(mode=0o755, exist_ok=True)
+    subprocess.run(["mount", "-t", "tmpfs", "-o", "size=1m,mode=755", "mcu-sftp", str(root)], check=True)
+
+    def bind(src, dst, is_dir=True):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if is_dir:
+            dst.mkdir(exist_ok=True)
+        else:
+            dst.touch()
+        subprocess.run(["mount", "--bind", str(src), str(dst)], check=True)
+        subprocess.run(["mount", "-o", "remount,bind,ro", str(dst)], check=True)
+
+    (root / "storage").mkdir()
+    for u in units_of(project, sizes=False):
+        kind, _, name = u["unit"].partition("/")
+        src = Path(os.path.realpath(u["path"]))
+        # a link the project made toward someone else's data shows nothing
+        if not src.is_dir() or not inside_project(project, src):
+            continue
+        if kind == "storage" and not name.startswith("."):
+            bind(src, root / "storage" / name)
+        elif kind == "results":
+            bind(src, root / "jobs")
+            # symlinks do not resolve once chrooted elsewhere: each name a bind
+            for link in sorted((src / ".latest").iterdir()) if (src / ".latest").is_dir() else []:
+                run = Path(os.path.realpath(link))
+                if link.is_symlink() and run.is_dir() and run.parent == src:
+                    bind(run, root / "latest" / link.name)
+    # sftp-server and what it loads, at their own paths
+    libs = re.findall(r"(/\S+) \(0x", subprocess.run(["ldd", SFTP_SERVER], capture_output=True, text=True).stdout)
+    for f in [SFTP_SERVER, *libs, "/dev/null"]:      # sftp-server opens /dev/null at start
+        bind(os.path.realpath(f), root / f.lstrip("/"), is_dir=False)
+    # sftp-server looks its user up: the project's entry alone, not the box's
+    (root / "etc").mkdir()
+    (root / "etc" / "passwd").write_text(f"{user}:x:{pw.pw_uid}:{pw.pw_gid}::/:/sbin/nologin\n")
+    (root / "etc" / "group").write_text(f"{grp.getgrgid(pw.pw_gid).gr_name}:x:{pw.pw_gid}:\n")
+    subprocess.run(["mount", "-o", "remount,ro", str(root)], check=True)
+    os.chroot(root)
+    os.chdir("/")
+    os.setgroups([])
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+    os.execv(SFTP_SERVER, ["sftp-server", "-R", "-d", "/"])
+
+
+def volume_path(name):
+    return STATE / "volumes" / f"{name}.json"
+
+
+# a quota per pool type: ssd (the keys of old, disk/admin_disk) and hdd
+MEDIA_KEY = {"ssd": "", "hdd": "_hdd"}
+
+
+def effective(conf, media="ssd"):
+    """the quota in force on a pool type: the admin's sticky override when
+    set, else the project's own setting, else the envelope's default (none
+    on hdd: a project gets room there when it or the admin asks)"""
+    k = MEDIA_KEY[media]
+    default = envelope().get("default_disk", "10g") if media == "ssd" else "0"
+    return parse_size(conf.get(f"admin_disk{k}") or conf.get(f"disk{k}") or default)
+
+
+def env_max(media):
+    """the most a project may ask for itself on a pool type"""
+    return envelope().get("max_disk_ssd" if media == "ssd" else "max_disk_hdd", "20g" if media == "ssd" else "0")
+
+
+def mount_media(mnt):
+    """a filesystem's pool type: the system's (/, where the homes are) counts
+    as ssd; else the type of the pool on it"""
+    if mnt == "/":
+        return "ssd"
+    for name, spec in pools()["pools"].items():
+        if mount_of(spec["path"]) == mnt:
+            return pool_media(name)
+    return "ssd"
+
+
+def mounts_by_media(project, units):
+    out = {"ssd": {"/"}, "hdd": set()}
+    for u in units:
+        out[mount_media(u["fs"])].add(u["fs"])
+    return out
+
+
+def requota():
+    """root, from mcu-admin after the envelope's default_disk changed: the
+    projects that never set their own ssd quota (nor the admin for them)
+    follow the default, so their quota is applied again"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    n = 0
+    for path in sorted((STATE / "projects").glob("*.json")):
+        conf = json.loads(path.read_text())
+        if conf.get("disk") or conf.get("admin_disk") or not project_exists(path.stem):
+            continue
+        set_quota(path.stem, f"mcu-{path.stem}", conf)
+        n += 1
+    print(f"mcu-helper: {n} project(s) on the default quota ({envelope().get('default_disk', '10g')})")
+
+
+def admin_quota(project, size, media="ssd"):
+    """root, from mcu-admin (the dashboard's slider): a quota the admin
+    sets for a project on a pool type, up to twice the envelope's max there
+    (on hdd, up to the hdd pools' size when the envelope gives projects
+    none); it sticks over the project's own setting until cleared with `none`"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    if not NAME_RE.match(project) or not project_exists(project):
+        die(f"no project {project}")
+    if media not in MEDIA_KEY:
+        die("the pool type is ssd or hdd")
+    k = MEDIA_KEY[media]
+    path = STATE / "projects" / f"{project}.json"
+    conf = json.loads(path.read_text())
+    if size == "none":
+        conf.pop(f"admin_disk{k}", None)
+    else:
+        limit = 2 * parse_size(env_max(media))
+        if media == "hdd" and not limit:
+            limit = sum(os.statvfs(sp["path"]).f_blocks * os.statvfs(sp["path"]).f_frsize
+                        for n, sp in pools()["pools"].items() if pool_media(n) == "hdd")
+        if parse_size(size) > limit:
+            die(f"{size} is above the admin's limit on {media} ({limit / 2**30:.0f} GB)")
+        conf[f"admin_disk{k}"] = size
+    path.write_text(json.dumps(conf, indent=1) + "\n")
+    set_quota(project, f"mcu-{project}", conf)
+    print(f"mcu-helper: {project}'s {media} quota is {conf.get(f'admin_disk{k}') or conf.get(f'disk{k}') or 'the default'}"
+          + (" (set by the admin, sticky)" if conf.get(f"admin_disk{k}") else ""))
+
+
+def disk_now():
+    """a project (through sudo): its use and quota right now, summed over the
+    filesystems it uses (the usage timer's figures are up to 5 minutes old);
+    the runner's pre-flight and disk learning ask it"""
+    project, user = caller()
+    conf = json.loads((STATE / "projects" / f"{project}.json").read_text())
+    out = {}
+    for media, mounts in mounts_by_media(project, units_of(project, sizes=False)).items():
+        out[media] = {"used": sum(fs_used(project, user, m) for m in mounts), "quota": effective(conf, media),
+                      "mounts": sorted(mounts)}
+    # used and quota at the top are the ssd's, as before the pool types
+    print(json.dumps({"used": out["ssd"]["used"], "quota": out["ssd"]["quota"], "media": out}))
+
+
+def quota(size, media="ssd"):
+    project, user = caller()
+    if media not in MEDIA_KEY:
+        die("the pool type is ssd or hdd")
+    k = MEDIA_KEY[media]
+    want = parse_size(size)
+    limit = parse_size(env_max(media))
+    if want > limit:
+        die(f"{size} is above the box's limit per project on {media} ({env_max(media)})")
+    path = STATE / "projects" / f"{project}.json"
+    conf = json.loads(path.read_text())
+    conf[f"disk{k}"] = size
+    path.write_text(json.dumps(conf, indent=1) + "\n")
+    set_quota(project, user, conf)
+    if conf.get(f"admin_disk{k}"):
+        print(f"mcu-helper: {project}'s {media} disk setting is {size}, but the admin set {conf[f'admin_disk{k}']}, which stays in force")
+    else:
+        print(f"mcu-helper: {project}'s {media} disk quota set to {size}")
+
+
+def _apply_readers(name, readers):
+    for r in readers:
+        if not NAME_RE.match(r) or not project_exists(r):
+            die(f"no project {r}")
+    group = f"vol-{name}"
+    members = set(grp.getgrnam(group).gr_mem)
+    want = {f"mcu-{r}" for r in readers}
+    for user in want - members:
+        subprocess.run(["gpasswd", "-a", user, group], check=True, stdout=subprocess.DEVNULL)
+    for user in members - want:
+        subprocess.run(["gpasswd", "-d", user, group], check=True, stdout=subprocess.DEVNULL)
+
+
+def volume_create(name, readers):
+    project, user = caller()
+    if not NAME_RE.match(name):
+        die("bad volume name")
+    if volume_path(name).exists():
+        die(f"volume {name} already exists")
+    owned = [p for p in (STATE / "volumes").glob("*.json")
+             if json.loads(p.read_text()).get("owner") == project]
+    if len(owned) >= envelope()["max_volumes"]:
+        die(f"{project} already owns {len(owned)} volumes, the box's limit")
+    subprocess.run(["groupadd", "-f", f"vol-{name}"], check=True)
+    _apply_readers(name, readers)
+    vdir = VOLUMES / name
+    vdir.mkdir(mode=0o2750)
+    os.chown(vdir, pwd.getpwnam(user).pw_uid, grp.getgrnam(f"vol-{name}").gr_gid)
+    os.chmod(vdir, 0o2750)
+    subprocess.run(["restorecon", "-R", str(vdir)], check=True)
+    volume_path(name).write_text(json.dumps({"owner": project, "readers": readers,
+                                             "keep_versions": 2}, indent=1) + "\n")
+    print(f"mcu-helper: volume {name} created (owner {project}; readers: {' '.join(readers) or 'none'})")
+
+
+def volume_readers(name, readers):
+    project, _ = caller()
+    if not NAME_RE.match(name) or not volume_path(name).exists():
+        die(f"no volume {name}")
+    conf = json.loads(volume_path(name).read_text())
+    if conf["owner"] != project:
+        die(f"{project} does not own volume {name}")
+    _apply_readers(name, readers)
+    conf["readers"] = readers
+    volume_path(name).write_text(json.dumps(conf, indent=1) + "\n")
+    print(f"mcu-helper: volume {name} readers: {' '.join(readers) or 'none'}")
+
+
+def du(path):
+    r = subprocess.run(["du", "-sb", str(Path(path).resolve())], capture_output=True, text=True)
+    try:
+        return int(r.stdout.split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def parts(project):
+    """what an admin reclaim or purge would free, in bytes"""
+    home = Path(pwd.getpwnam(f"mcu-{project}").pw_dir)
+    old = time.time() - 2 * 86400
+    graph = home / ".local/share/containers"
+    sconf = home / ".config/containers/storage.conf"
+    if sconf.exists():
+        m = re.search(r'graphroot\s*=\s*"([^"]+)"', sconf.read_text())
+        graph = Path(m.group(1)) if m else graph
+    p = {"images": du(graph) + (du(home / ".local/share/containers") if graph != home / ".local/share/containers" else 0),
+         "tmp_storage": 0, "kept_storage": 0,
+         "src": du(home / "src"), "old_results": 0, "recent_results": 0, "volumes": 0}
+    p["images"] += sum(du(f) for f in Path("/var/tmp").glob("*") if f.owner() == f"mcu-{project}")
+    if (tree(project) / "tmp").exists():
+        p["images"] += du(tree(project) / "tmp")
+    cache = home / "cache"
+    for c in cache.iterdir() if cache.exists() else []:
+        if not c.is_dir():
+            continue
+        if (c / ".bench-tmp").exists():
+            p["tmp_storage"] += du(c)
+        elif (c / ".bench-per").exists():
+            # per-branch trees from before the tmp tag: reclaim drops them too
+            subs = [x for x in c.iterdir() if x.is_dir()]
+            p["tmp_storage"] += sum(du(x) for x in subs)
+            p["kept_storage"] += du(c) - sum(du(x) for x in subs)
+        else:
+            p["kept_storage"] += du(c)
+    for d in (home / "jobs").glob("2*"):
+        p["old_results" if d.stat().st_mtime < old else "recent_results"] += du(d)
+    for vp in (STATE / "volumes").glob("*.json"):
+        if json.loads(vp.read_text()).get("owner") == project:
+            p["volumes"] += du(VOLUMES / vp.stem)
+    p["reclaimable"] = p["images"] + p["tmp_storage"] + p["old_results"]
+    p["purgeable"] = p["reclaimable"] + p["kept_storage"] + p["src"] + p["recent_results"]
+    p["measured"] = time.time()
+    return p
+
+
+def timing_holder():
+    """the running job holding the machine, if any (state.json)"""
+    try:
+        sched = json.loads((STATE / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return next((r for r in sched.get("running", []) if "machine" in r.get("exclusive", [])), None)
+
+
+def perf_cap(value):
+    """a timing job's frequency cap: only its project's runner, while it holds
+    the machine, may set it; `off` (full speed) is always allowed"""
+    project, _ = caller()
+    if value == "off":
+        cpufreq.reset()
+        power_restore()          # the chosen power profile back after a timing job
+        return
+    holder = timing_holder()
+    if not holder or holder["project"] != project:
+        die("only a job holding the machine may cap the frequency")
+    pct = int(value)
+    if not 30 <= pct <= 100:
+        die("cap between 30 and 100 %")
+    if not cpufreq.set_cap(pct):
+        die("no frequency control on this box (no intel_pstate, no cpufreq): timing jobs run uncapped")
+    prof = power_profiles()
+    if prof:
+        power_write(prof["fast"])   # timing jobs: always the fast profile, so timings stay comparable
+
+
+# the CPU's power profile: RAPL's long-term limit (PL1), picked in the
+# dashboard among three positions; timing jobs run at the fast one
+POWER_PROFILES = ("fast", "balanced", "quiet")
+
+
+def power_state():
+    try:
+        return json.loads((STATE / "power.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def power_profiles():
+    """watts per profile: box.toml [power] when set, else from this CPU's own
+    long-term limit (as found the first time): fast = it, balanced 2/3 of
+    it, quiet half; {} on a CPU without RAPL"""
+    now = rapl.limit_w()
+    if now is None:
+        return {}
+    st = power_state()
+    if not st.get("firmware_w"):
+        st["firmware_w"] = round(now)
+        save_power(st)
+    base, conf = st["firmware_w"], box_conf().get("power", {})
+    return {"fast": float(conf.get("fast", base)), "balanced": float(conf.get("balanced", round(base * 2 / 3))),
+            "quiet": float(conf.get("quiet", round(base / 2)))}
+
+
+def save_power(st):
+    tmp = STATE / "power.json.tmp"
+    tmp.write_text(json.dumps(st, indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE / "power.json")
+
+
+def power_write(watts):
+    try:
+        rapl.set_limit_w(watts)
+    except (ValueError, OSError) as e:
+        die(str(e))
+
+
+def power_set(profile):
+    """root (mcu-admin power, the dashboard's slider): the profile now and
+    at every boot; while a timing job holds the machine it applies after it"""
+    if os.geteuid() != 0 or project_caller():
+        die("admin only")
+    prof = power_profiles()
+    if not prof:
+        die("this CPU has no RAPL power limit to set")
+    if profile not in POWER_PROFILES:
+        die("the profile is fast, balanced or quiet")
+    st = power_state()
+    st.update(profile=profile, watts=prof[profile], at=time.time())
+    save_power(st)
+    if not timing_holder():
+        power_write(prof[profile])
+    with open(STATE / "events.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"kind": "box", "power": profile, "watts": prof[profile], "t": time.time()}) + "\n")
+    print(f"mcu-helper: CPU power {profile} ({prof[profile]:g} W)")
+
+
+def power_profile_watts():
+    """the chosen profile's watts (fast when none was chosen)"""
+    prof = power_profiles()
+    return prof.get(power_state().get("profile", "fast"), prof.get("fast")) if prof else None
+
+
+def power_restore():
+    """the chosen profile back: at boot, and when a timing job lets go"""
+    w = power_profile_watts()
+    if w:
+        power_write(w)
+
+
+def cpu_temp():
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            if (hw / "name").read_text().strip() in ("coretemp", "k10temp", "x86_pkg_temp"):
+                temps = [int(t.read_text()) / 1000 for t in hw.glob("temp*_input")]
+                return max(temps) if temps else None
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def timing_tick():
+    """from the usage timer: a cap no timing job holds goes back to full
+    speed; with nothing running, the temperature feeds the idle estimate
+    the auto cool-down target is built on"""
+    path = STATE / "timing.json"
+    try:
+        t = json.loads(path.read_text())
+    except (OSError, ValueError):
+        t = {}
+    if not timing_holder() and cpufreq.capped():
+        cpufreq.reset()
+        power_restore()
+    try:
+        sched = json.loads((STATE / "state.json").read_text())
+    except (OSError, ValueError):
+        sched = {}
+    # measured, not configured: idle.json, apart from the admin's timing.json
+    # (an older box kept the samples there: they move once)
+    ipath = STATE / "idle.json"
+    try:
+        m = json.loads(ipath.read_text())
+    except (OSError, ValueError):
+        m = {}
+    if "idle_samples" in t or "idle_temp" in t:
+        m.setdefault("samples", t.pop("idle_samples", None) or [])
+        t.pop("idle_temp", None)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(t, indent=1) + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    temp = cpu_temp()
+    if not sched.get("running") and temp is not None:
+        idle = (m.get("samples") or [])[-47:] + [temp]
+        m = {"samples": idle, "idle_temp": sorted(idle)[len(idle) // 2], "updated": time.time()}
+        tmp = ipath.with_suffix(".tmp")
+        tmp.write_text(json.dumps(m, indent=1) + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, ipath)
+
+
+def usage(with_parts=False):
+    """each project's disk use and quota, for the dashboard and the quota
+    warnings: from its timer, or a project's `config clean` to refresh it.
+    --parts (the timer) also measures what a reclaim or purge would free;
+    without it the last measure is kept"""
+    if os.geteuid() != 0:
+        die("usage runs as root")
+    # a card that fell off the bus raises no udev event: the box says why
+    # it is gone, and what brings it back, instead of a bare "absent"
+    if egpu.fell_off_bus() and gpu_state() != "lost":
+        gpu_set("lost", egpu.FELL_OFF)
+        gpu_refresh("fell-off")
+    if with_parts:
+        timing_tick()
+    try:
+        previous = json.loads((STATE / "usage.json").read_text())
+    except (OSError, ValueError):
+        previous = {}
+    data = {}
+    for pp in sorted((STATE / "projects").glob("*.json")):
+        project, user = pp.stem, f"mcu-{pp.stem}"
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            continue
+        conf = json.loads(pp.read_text())
+        q = effective(conf)
+        units = units_of(project)
+        if with_parts:
+            spread(project, user, conf, units)
+        by = mounts_by_media(project, units)
+        media = {m: {"used": sum(fs_used(project, user, x) for x in by[m]), "quota": effective(conf, m)} for m in by}
+        # used and quota at the top stay the ssd's, as before the pool types
+        data[project] = {"used": media["ssd"]["used"], "quota": q, "media": media, "pool": conf.get("pool"),
+                         "units": [{k: u[k] for k in ("unit", "kind", "pool", "bytes")} for u in units],
+                         "tree": any(u["pool"] != "home" for u in units)}
+        if True:
+            if with_parts and project_exists(project):
+                data[project]["parts"] = parts(project)
+            elif "parts" in previous.get(project, {}):
+                data[project]["parts"] = previous[project]["parts"]
+    pinfo = {}
+    ps = pools()
+    for name, spec in ps["pools"].items():
+        pinfo[name] = pool_check(spec["path"])
+        # promised there: the units living there, plus each project's room
+        # left counted on its default pool
+        here = {p: sum(x["bytes"] for x in u.get("units", []) if x["pool"] == name) for p, u in data.items()}
+        # the room left on a type is counted on the project's default pool for
+        # ssd, on the first hdd pool for hdd
+        kind = pool_media(name)
+        hdd_first = next((n for n in ps["pools"] if pool_media(n) == "hdd"), None)
+        promised = sum(here.values()) + sum(
+            max(u["media"][kind]["quota"] - u["media"][kind]["used"], 0) for p, u in data.items()
+            if (kind == "ssd" and (u.get("pool") or ps.get("default")) == name) or (kind == "hdd" and name == hdd_first))
+        pinfo[name].update(path=spec["path"], default=name == ps.get("default"), media=pool_media(name),
+                           budget=spec.get("budget", pinfo[name].get("size", 0)),
+                           projects=sorted(p for p, b in here.items() if b),
+                           quotas=promised)
+    tmp = STATE / "usage.json.tmp"
+    tmp.write_text(json.dumps(dict(data, _pools=pinfo, _disks=dict(disks(), smart=hw_smart.read_all())), indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE / "usage.json")
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args[:1] == ["quota"] and len(args) in (2, 3):
+        quota(args[-1], args[1] if len(args) == 3 else "ssd")
+    elif args == ["disk-now"]:
+        disk_now()
+    elif args[:1] == ["volume-create"] and len(args) >= 2:
+        volume_create(args[1], args[2:])
+    elif args[:1] == ["volume-readers"] and len(args) >= 2:
+        volume_readers(args[1], args[2:])
+    elif args[:1] == ["place-unit"] and len(args) in (2, 3):
+        place_unit(*caller(), *args[1:])
+    elif args[:1] == ["place-media"] and len(args) == 3:
+        place_media(caller()[0], args[1], args[2])
+    elif args[:1] == ["power"] and len(args) == 2:
+        power_set(args[1])
+    elif args == ["power-restore"]:
+        if os.geteuid() != 0 or project_caller():
+            die("admin only")
+        power_restore()
+    elif args == ["power-show"]:
+        print(json.dumps({"profiles": power_profiles(), "profile": power_state().get("profile", "fast"),
+                          "limit_w": rapl.limit_w()}))
+    elif args == ["pools-media"]:
+        print(json.dumps({n: pool_media(n) for n in pools()["pools"]}))
+    elif args[:1] == ["move-unit"] and len(args) == 4:
+        move_unit(args[1], args[2], args[3])
+    elif args == ["sftp"]:
+        sftp_view()
+    elif args[:1] == ["shutdown-run"] and len(args) == 2:
+        shutdown_run(args[1])
+    elif args == ["gpu-eject"]:
+        gpu_eject()
+    elif args == ["gpu-attach"]:
+        gpu_attach()
+    elif args[:1] == ["gpu-pending"] and len(args) == 2 and args[1] in ("on", "off"):
+        gpu_pending(args[1] == "on")
+    elif args[:1] == ["gpu-event"] and len(args) == 2:
+        gpu_event(args[1])
+    elif args == ["gpu-shutdown"]:
+        gpu_shutdown()
+    elif args[:1] == ["units"] and len(args) == 2:
+        if os.geteuid() != 0 or project_caller():
+            die("admin only")
+        print(json.dumps(units_of(args[1]), indent=1))
+    elif args == ["disks"]:
+        print(json.dumps(disks(), indent=1))
+    elif args[:1] == ["pool-check"] and len(args) == 2:
+        if os.geteuid() != 0 or project_caller():
+            die("admin only")
+        print(json.dumps(pool_check(args[1])))
+    elif args == ["requota"]:
+        requota()
+    elif args[:1] == ["admin-quota"] and len(args) in (3, 4):
+        admin_quota(args[1], args[-1], args[2] if len(args) == 4 else "ssd")
+    elif args[:1] == ["perf-cap"] and len(args) == 2:
+        perf_cap(args[1])
+    elif args in (["usage"], ["usage", "--parts"]):
+        usage(with_parts=args[1:] == ["--parts"])
+    else:
+        die("usage: quota <size> | volume-create <name> [reader...] | volume-readers <name> [reader...]"
+            " | usage [--parts]")

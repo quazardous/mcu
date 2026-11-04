@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Installs the box's files from a checkout or a release tree: box/install.list
+# into /usr/local/lib/mcu, the dashboard (dashboard/dist, built beforehand:
+# npm run build, or shipped built in a release) as ui/, and the projects'
+# forced command /usr/local/bin/mcu-job, and mcu-admin in /usr/local/sbin. DESTDIR stages it elsewhere (a
+# package build). Only files change: no service, account or data.
+set -euo pipefail
+top="$(cd "$(dirname "$0")/.." && pwd)"
+lib="${DESTDIR:-}/usr/local/lib/mcu"
+bin="${DESTDIR:-}/usr/local/bin"
+sbin="${DESTDIR:-}/usr/local/sbin"
+install -d -m 755 "$lib" "$bin" "$sbin"
+grep -v '^\s*\(#\|$\)' "$top/box/install.list" | while read -r _ src dst mode _; do
+  install -D -m "$mode" "$top/$src" "$lib/$dst"
+done
+[ -f "$top/dashboard/dist/index.html" ] || { echo "install-files: build the dashboard first (dashboard/: npm ci && npm run build)" >&2; exit 2; }
+rm -rf "$lib/ui.new" && cp -r "$top/dashboard/dist" "$lib/ui.new" && chmod -R a+rX "$lib/ui.new"
+rm -rf "$lib/ui" && mv "$lib/ui.new" "$lib/ui"
+printf '#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/mcu/mcu.py entry\n' > "$bin/mcu-job"
+chmod 755 "$bin/mcu-job"
+# the admin's command, in root's PATH
+ln -sfn /usr/local/lib/mcu/mcu-admin "$sbin/mcu-admin"

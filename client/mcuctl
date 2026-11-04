@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""mcuctl: drive an mcu box from your machine, as a project or as its admin.
+
+The key and the host are configuration (`mcuctl help config`), so a command
+line is only `mcuctl <command> ...`: no ssh, no host, no sudo in sight.
+"""
+
+import json
+import shlex
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mcu.core import EX_TEMPFAIL, PROJECT_VERBS, Box, ConfigError, load_config  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+LIB = "/usr/local/lib/mcu"
+
+HELP = """usage: mcuctl <command> [args...]
+
+as a project (MCU_HOST, MCU_KEY):
+  run <job> [key=value...]          queue a job and follow its log (exit: the job's)
+      [after=<id>,...] [after_ok=<id>,...]   once those ended / succeeded (else exit 79)
+      [priority=high|low]           orders your own jobs; bump <id> [high|normal|low] later
+  run a [k=v...] -- b [k=v...]      a chain: each step after_ok the one before
+  chain [--detach] [priority=<p>] < steps   "name = job [k=v...] [after_ok=name,...]" per line
+  wait <id> | status <id> [--json]  follow or check a job
+  cancel <id> | cancel --branch <b> stop one of your jobs, queued or running (exit 130)
+  list                              your last jobs
+  jobs                              the box's queue now: running and waiting jobs,
+                                    memory reserved and used, expected times, your job ids
+  queue [--json]                    the same, as the box prints it (capacity, rule, times)
+  fetch <id> [<output>] [--to DIR]  a job's results (a tar on stdout, or unpacked in DIR)
+  fetch latest <job> [k=v...] <output> [--to DIR]
+  benchfile [<label>] [<file>]      upload a Benchfile (default tools/mcu/Benchfile, or tools/bench/Benchfile), with
+                                    from=<branch>@<commit> of its checkout (config show)
+  box | health [--json]             the box's state and what it can do now
+  docs [--list | <topic>]           the box's documentation, at the version it runs
+  config ... | storage ... | volume ... | provision ... | push <name> < tar
+  debug <job> [k=v...]              a shell in the job's container (a terminal)
+
+as the box's admin (MCU_ADMIN_HOST, MCU_ADMIN_KEY):
+  admin status [--json]             the box at a glance
+  admin queue open|pause <why>|close <why>    admin power fast|balanced|quiet
+  admin envelope [list|set <k> <v>|reset <k>]
+  admin gpu eject|attach            admin quota <project> [ssd|hdd] <size>|none
+  admin cancel <project> <id>|--branch <b>    admin orphans [--stop]
+  admin shutdown reboot|poweroff|test | cancel | status    a graceful restart (test: no restart)
+  admin pool ... | task ... | timing ... | migrate ... | prune | list
+  admin logs [dashboard|task|egpu|events|<project> <id>] [-n N]
+  admin deploy [--parts <part>,...] [--priority|--when-idle|--now] [--dry-run]   (--help: the parts)
+                                    mcu: --priority (default) pauses the queue, waits for the
+                                    running jobs, installs, reopens; --when-idle waits for no job
+
+  help config                       where the key and the host come from
+
+Exit 75: the box can't serve it now (unreachable, maintenance, GPU absent):
+retry later. Exit 78: it never can (fix the request).
+"""
+
+HELP_CONFIG = """mcuctl reads its settings from the environment, else from the file
+MCU_CONFIG names (default: client/.env.local next to mcuctl), KEY=value lines:
+
+  MCU_HOST=mcu-<project>@<box>   your project's user on the box (BENCH_HOST, for one release)
+  MCU_KEY=/path/to/project.key     its private key, mode 600 (BENCH_KEY, for one release);
+                                   ssh's default keys when unset
+  MCU_ADMIN_HOST=<you>@<box>       the admin's account (sudo): enables `admin ...`
+  MCU_ADMIN_KEY=/path/to/admin.key optional
+
+Nothing secret is printed or passed on the command line. Point a permission
+layer at `mcuctl` alone: every command is a fixed action, and the box checks
+each one (a project's key only reaches its own forced command)."""
+
+ADMIN_VERBS = {"queue", "maintenance", "power", "envelope", "gpu", "quota", "pool", "task", "timing", "migrate",
+               "prune", "list", "cancel", "orphans", "reclaim", "purge", "invite", "revoke", "shutdown"}
+
+def read_parts():
+    """what deploy installs: box/install.list, the list make install and
+    mcu-admin init use too; {part: [(source, destination, mode, service)...]}"""
+    parts = {}
+    for line in (REPO / "box" / "install.list").read_text().splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            part, src, dst, mode, svc = line.split()
+            parts.setdefault(part, []).append((src, f"{LIB}/{dst}", mode, None if svc == "-" else svc))
+    return parts
+
+
+PARTS = read_parts()
+
+
+def die(msg, code=2):
+    print(f"mcuctl: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def gb(b):
+    return f"{b / 2**30:.1f}" if b else "-"
+
+
+def ago(t):
+    s = max(0, int(time.time() - (t or time.time())))
+    return f"{s // 3600}h{s % 3600 // 60:02d}" if s >= 3600 else f"{s // 60}m{s % 60:02d}"
+
+
+def show_queue(q, mine_only=False):
+    """the running and waiting jobs, one line each"""
+    hhmm = lambda t: time.strftime("%H:%M", time.localtime(t)) if t else "?"
+    cap = q.get("capacity")
+    print(f"queue {q.get('mode')}" + (f" ({q['reason']})" if q.get("reason") else "")
+          + (f"; {cap['threads']} threads, {gb(cap['memory'])} GB for jobs" if cap else ""))
+    for r in q.get("running", []):
+        used = f" used {gb(r.get('mem_now'))} peak {gb(r.get('mem_peak'))}" if r.get("mem_now") else ""
+        print(f"  running  {r['project']}/{r['job']:<22} {len(r.get('threads') or []):>2} threads  "
+              f"{gb(r.get('memory'))} GB reserved{used}  {ago(r.get('started'))}"
+              + (f"  end ~{hhmm(r.get('eta_end'))}" if "eta_end" in r else "")
+              + (f"  {r['id']}" if r.get("id") else ""))
+        if r.get("about"):
+            print(f"           {r['about']}")
+    for w in q.get("waiting", []):
+        print(f"  waiting  {w['project']}/{w['job']:<22} {w.get('cores') or '?':>2} threads  "
+              f"{gb(w.get('memory'))} GB reserved  {ago(w.get('queued'))}"
+              + (f"  #{w['position']} start ~{hhmm(w.get('eta_start'))}" if "position" in w else "")
+              + (f"  {w['id']}" if w.get("id") else ""))
+        if w.get("about"):
+            print(f"           {w['about']}")
+        if w.get("waiting"):
+            print(f"           {w['waiting']}")
+    for b in q.get("blocked", []):
+        print(f"  deps     {b['project']}/{b['job']:<22} "
+              + (f"for {b['waiting_for']}  " if b.get("waiting_for") else "")
+              + f"not before ~{hhmm(b.get('eta_start'))}" + (f"  {b['id']}" if b.get("id") else ""))
+    if not q.get("running") and not q.get("waiting") and not q.get("blocked"):
+        print("  (empty)")
+
+
+def fetch_to(box, args, dest):
+    """fetch a job's results and unpack them in dest"""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(box.command(["fetch", *args]), stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    names = []
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|*") as tar:
+            for m in tar:
+                if m.issym() or m.islnk() or m.name.startswith("/") or ".." in Path(m.name).parts:
+                    continue  # a job's results never write outside dest
+                tar.extract(m, dest, filter="data")
+                names.append(m.name)
+    except tarfile.ReadError:
+        pass
+    code = proc.wait()
+    if code == 255:
+        die("mcu box unreachable: retry later", EX_TEMPFAIL)
+    for n in names:
+        print(dest / n)
+    return code if names or code else 1
+
+
+def project(cmd, args):
+    conf = load_config()
+    box = Box(conf)
+    if cmd == "jobs":
+        code, out, err = box.run(["health", "--json"], capture=True)
+        if code:
+            print(err.strip(), file=sys.stderr)
+            return code
+        show_queue(json.loads(out)["queue"])
+        return 0
+    if cmd == "benchfile":
+        label = [a for a in args[:1] if not Path(a).is_file()]
+        rest = args[len(label):]
+        path = Path(rest[0]) if rest else next((p for p in (Path("tools/mcu/Benchfile"), Path("tools/bench/Benchfile")) if p.is_file()), Path("tools/mcu/Benchfile"))
+        if not path.is_file():
+            die(f"no Benchfile at {path}")
+        # where it came from, for `config show`: the checkout's branch and commit
+        git = lambda *a: subprocess.run(["git", *a], cwd=path.parent, capture_output=True, text=True).stdout.strip()
+        source = [f"from={git('rev-parse', '--abbrev-ref', 'HEAD')}@{git('rev-parse', '--short=12', 'HEAD')}"] \
+            if git("rev-parse", "--short=12", "HEAD") else []
+        with open(path, "rb") as f:
+            return box.run(["config", "benchfile", *label, *source], stdin=f)
+    if cmd == "fetch" and "--to" in args:
+        i = args.index("--to")
+        if i + 1 >= len(args):
+            die("--to needs a directory")
+        return fetch_to(box, args[:i] + args[i + 2:], args[i + 1])
+    if cmd == "fetch" and sys.stdout.isatty():
+        die("fetch writes a tar: redirect it (> results.tar) or give --to DIR")
+    if cmd == "debug":
+        if not sys.stdin.isatty():
+            die("debug needs a terminal")
+        return box.run([cmd, *args], tty=True)
+    stdin = None if cmd in ("push", "config", "chain") else subprocess.DEVNULL
+    return box.run([cmd, *args], stdin=stdin)
+
+
+ADMIN_SCRIPTS = {
+    "dashboard": "journalctl -u mcu-dashboard --no-pager -n {n}",
+    "task": "journalctl -u mcu-task --no-pager -n {n}",
+    "egpu": "journalctl -t mcu-egpu --no-pager -n {n}",
+    "events": "tail -n {n} /var/lib/mcu/events.jsonl",
+}
+
+
+# a priority upgrade: pause the queue when it is open (marked as the
+# deploy's, with this script's pid), and reopen it on any exit of the script;
+# a deploy's pause whose script is gone is cleared by the collector
+DEPLOY_PAUSE = r"""
+mine=0
+admin=/usr/local/lib/mcu/mcu-admin
+release() {
+    [ "$mine" = 1 ] || return 0
+    "$admin" queue open --if-by "deploy:$$" | grep -q 'queue open$' && echo "mcu: queue reopened"
+    return 0
+}
+trap release EXIT
+trap 'exit 1' HUP INT TERM
+if [ "$(jq -r '.mode // "open"' /var/lib/mcu/queue.json 2>/dev/null || echo open)" = open ]; then
+    left=$(python3 /usr/local/lib/mcu/mcu.py health 2>/dev/null | jq -r '.queue.expected_wait.seconds // empty' || true)
+    reason="box upgrade: installing a new version, jobs start again when it is done"
+    if "$admin" queue pause "$reason" --by "deploy:$$" ${left:+--until "+$(( (left + 60 + 59) / 60 ))m"} > /dev/null; then
+        mine=1
+        echo "mcu: queue paused for the upgrade (running jobs finish${left:+, ~$((left / 60)) min})"
+    else
+        echo "mcu: the queue could not be paused (an older box?): installing with it open"
+    fi
+else
+    echo "mcu: the queue is already paused or closed by the admin: left as it is"
+fi
+"""
+
+
+DEPLOY_HELP = """mcuctl admin deploy [--parts <part>,...] [--priority|--when-idle|--now] [--dry-run]
+  copies this checkout to the box and installs the parts that changed
+  --parts      only these (default: all but mcu, plus ui); parts: {parts}
+  --priority   mcu.py too: pause the queue, wait for the running jobs, install, reopen (the default with mcu)
+  --when-idle  mcu.py too, at a moment with no job running
+  --now        mcu.py too, at once (running jobs keep the old code)
+  --dry-run    print what would run, change nothing"""
+DEPLOY_FLAGS = ("--parts", "--priority", "--when-idle", "--now", "--dry-run")
+
+
+def deploy_args(args):
+    """deploy's options checked before anything is built or copied: None for
+    help, else the list of words; an unknown option stops (a typo must not
+    deploy)"""
+    if "-h" in args or "--help" in args:
+        return None
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if a == "--parts":
+            skip = True
+            continue
+        if a not in DEPLOY_FLAGS:
+            die(f"deploy: unknown option {a} (known: {', '.join(DEPLOY_FLAGS)}; mcuctl admin deploy --help)")
+    return args
+
+
+def deploy(box, args):
+    if deploy_args(args) is None:
+        print(DEPLOY_HELP.format(parts=",".join(list(PARTS) + ["ui"])))
+        return 0
+    parts = None
+    when_idle = "--when-idle" in args
+    now = "--now" in args
+    priority = "--priority" in args
+    dry = "--dry-run" in args
+    if "--parts" in args:
+        i = args.index("--parts")
+        parts = args[i + 1].split(",") if i + 1 < len(args) else die("--parts needs a list")
+    # by default every part of install.list (mcu.py only when it may be replaced) and the dashboard
+    parts = parts or [p for p in PARTS if p != "mcu"] + ["ui"] + (["mcu"] if when_idle or now or priority else [])
+    bad = [p for p in parts if p not in PARTS and p != "ui"]
+    if bad:
+        die(f"unknown part(s) {', '.join(bad)}: {', '.join(list(PARTS) + ['ui'])}")
+    # mcu.py is used by the running jobs' runners: by default an upgrade
+    # takes priority (the queue pauses, running jobs end, it installs, the
+    # queue reopens); --when-idle waits for a moment with no job; --now at once
+    priority = "mcu" in parts and (priority or not (when_idle or now))
+    if "ui" in parts and not dry:
+        print("building the dashboard")
+        if subprocess.run(["npm", "run", "build"], cwd=REPO / "dashboard", stdout=subprocess.DEVNULL).returncode:
+            die("the dashboard does not build", 1)
+    rsync = ["rsync", "-a", "--exclude", "node_modules", "--exclude", ".git", "--exclude", "*.local.toml",
+             "--exclude", ".env.local", "--exclude", "__pycache__", "-e", " ".join(box.ssh),
+             f"{REPO}/", f"{box.host}:mcu-setup/"]
+    print(("would copy" if dry else "copying") + f" the repository to {box.host}:mcu-setup/")
+    if not dry and subprocess.run(rsync).returncode:
+        die("rsync failed", EX_TEMPFAIL)
+    lines = ["set -e", "s=$(getent passwd \"$SUDO_USER\" | cut -d: -f6)/mcu-setup"]
+    if priority:
+        lines += [DEPLOY_PAUSE]
+    restart = set()
+    for p in parts:
+        if p == "ui":
+            lines += [f"rm -rf {LIB}/ui.new", f"cp -r $s/dashboard/dist {LIB}/ui.new", f"chmod -R a+rX {LIB}/ui.new",
+                      f"rm -rf {LIB}/ui", f"mv {LIB}/ui.new {LIB}/ui", "echo 'ui: installed'"]
+            continue
+        if p == "mcu" and (when_idle or priority):
+            lines += ["for i in $(seq 1 7200); do n=$(jq '.running|length' /var/lib/mcu/state.json); "
+                      "[ \"$n\" = 0 ] && break; [ $i = 1 ] && echo \"mcu: waiting for $n running job(s) to end\"; sleep 3; done",
+                      "[ \"$n\" = 0 ] || { echo 'mcu: the box never went idle, not installed'; exit 75; }"]
+        for src, dst, mode, svc in PARTS[p]:
+            install = f"install -D -m {mode} $s/{src} {dst}"
+            lines += [f"cmp -s $s/{src} {dst} && echo '{p}: {dst.rsplit('/', 1)[-1]} unchanged' "
+                      f"|| {{ {install} && echo '{p}: {dst.rsplit('/', 1)[-1]} installed'; }}"]
+            if svc:
+                restart.add(svc)
+    for svc in sorted(restart):
+        lines.append(f"systemctl restart {svc} && echo '{svc}: restarted'")
+    script = "\n".join(lines) + "\n"
+    if dry:
+        print(script)
+        return 0
+    code, out, err = box.shell(script, capture=False)
+    return code
+
+
+def admin(args):
+    if not args:
+        die("admin what? (mcuctl help)")
+    box = Box(load_config(), admin=True)
+    cmd, rest = args[0], args[1:]
+    if cmd == "status":
+        code, out, err = box.run(["status"], capture=True)
+        if code:
+            print(err.strip(), file=sys.stderr)
+            return code
+        if "--json" in rest:
+            sys.stdout.write(out.decode())
+            return 0
+        st = json.loads(out)
+        g, pw = st.get("gpu") or {}, st.get("power") or {}
+        gpu = (f"{g.get('name', 'present')} ({g.get('util', 0):g} %, {gb(g.get('vram_used'))}/{gb(g.get('vram_total'))} GB)"
+               if g.get("present") else "absent" if g else "-")
+        print(f"box {st.get('status')}  ·  GPU {gpu}  ·  power {pw.get('profile', '-')}"
+              + (f" {pw.get('watts'):g} W" if pw.get("watts") else ""))
+        if st.get("envelope", {}).get("summary"):
+            print(st["envelope"]["summary"])
+        show_queue(st["queue"])
+        return 0
+    if cmd == "logs":
+        n = "50"
+        if "-n" in rest:
+            i = rest.index("-n")
+            n = rest[i + 1] if i + 1 < len(rest) and rest[i + 1].isdigit() else die("-n needs a number")
+            rest = rest[:i] + rest[i + 2:]
+        what = rest[0] if rest else "dashboard"
+        if what in ADMIN_SCRIPTS:
+            script = ADMIN_SCRIPTS[what].format(n=n)
+        elif len(rest) == 2 and rest[0].isidentifier() and len(rest[1]) == 20:
+            script = f"tail -n {n} /home/mcu-{shlex.quote(rest[0])}/jobs/{shlex.quote(rest[1])}/log"
+        else:
+            die("logs dashboard|task|egpu|events|<project> <id> [-n N]")
+        code, out, err = box.shell(script, capture=False)
+        return code
+    if cmd == "deploy":
+        return deploy(box, rest)
+    if cmd not in ADMIN_VERBS:
+        die(f"unknown admin command {cmd} (mcuctl help)")
+    return box.run([cmd, *rest], stdin=subprocess.DEVNULL)
+
+
+def main(argv):
+    if argv[:1] == ["--version"]:
+        print((REPO / "VERSION").read_text().strip())
+        return 0
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(HELP_CONFIG if argv[1:2] == ["config"] else HELP)
+        return 0
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "admin":
+            return admin(args)
+        if cmd in PROJECT_VERBS or cmd in ("jobs", "benchfile"):
+            return project(cmd, args)
+        die(f"unknown command {cmd} (mcuctl help)")
+    except ConfigError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

@@ -12,7 +12,7 @@ DIST := mcu-$(VERSION)
 
 .PHONY: install dashboard dist check lint release clean
 
-PYFILES := box/mcu.py box/api.py box/collect.py box/mcuconf.py box/mcu-helper box/mcu-task box/hw \
+PYFILES := box/mcu.py box/api.py box/collect.py box/mcuconf.py box/fstab.py box/mcu-helper box/mcu-task box/hw \
 	client/mcuctl client/mcu tests scripts/check-refs
 SHFILES := box/mcu-admin box/install-files client/remote.sh .githooks/pre-commit .githooks/commit-msg
 RUFF := $(shell command -v ruff 2>/dev/null || echo uvx ruff)

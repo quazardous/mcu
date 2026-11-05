@@ -1238,6 +1238,11 @@ PY
       else
         say missing "pool $pp: XFS with project quotas" "mount $mnt with the prjquota option (fstab), then reboot or remount"
       fi
+      # mounted here now, but fstab mounts it elsewhere (or not at all): the
+      # next boot puts it back there, and the projects' links lead nowhere
+      if [ "$mnt" != / ] && ! python3 "$here/fstab.py" has /etc/fstab "$mnt"; then
+        say missing "pool $pp: $mnt in /etc/fstab" "it is mounted there but fstab does not mount it there: fix its mount point in fstab before the next boot"
+      fi
     done
     # what init installs and runs
     [ -x "$lib/mcu.py" ] && [ -x /usr/local/bin/mcu-job ] && say ok "mcu installed in $lib" \
@@ -1309,14 +1314,15 @@ PY
     ;;
   migrate-name)
     # migrate-name [--reverse] | --drop-aliases: a box installed under the
-    # first name (bench) becomes mcu: accounts, groups, paths, units,
-    # sudoers, SELinux contexts, the forced command in each key. The uids
-    # do not change, so file ownership, XFS project quotas (id = uid),
-    # /run/user/<uid> and lingering stay valid. The queue is closed and
-    # running jobs are waited for first; everything changed is backed up,
-    # and --reverse puts it back. Each project keeps a bench-<project>
-    # alias (same uid, same home) so old clients still log in, until
-    # --drop-aliases. Idempotent: a step already done is skipped.
+    # first name (bench) becomes mcu: accounts, groups, paths (and their
+    # mount points in fstab), units, sudoers, SELinux contexts, the forced
+    # command in each key. The uids do not change, so file ownership, XFS
+    # project quotas (id = uid), /run/user/<uid> and lingering stay valid.
+    # The queue is closed and running jobs are waited for first; everything
+    # changed is backed up, and --reverse puts it back. Each project keeps
+    # a bench-<project> alias (same uid, same home) so old clients still
+    # log in, until --drop-aliases. Idempotent: a step already done is
+    # skipped.
     mode="${2:-}"
     [ $# -le 2 ] && { [ -z "$mode" ] || [ "$mode" = --reverse ] || [ "$mode" = --drop-aliases ]; } \
       || die "usage: migrate-name [--reverse | --drop-aliases]"
@@ -1359,7 +1365,7 @@ PY
     if [ "$mode" != --reverse ] && [ ! -d "$backup" ]; then
       echo "migrate-name: backup in $backup"
       install -d -m 700 "$backup"
-      cp -a /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/subuid /etc/subgid "$backup/" 2> /dev/null || true
+      cp -a /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/subuid /etc/subgid /etc/fstab "$backup/" 2> /dev/null || true
       cp -a /etc/sudoers.d/bench "$backup/" 2> /dev/null || true
       cp -a /etc/systemd/system/bench-* "$backup/" 2> /dev/null || true
       cp -a /etc/bench "$backup/etc-bench" 2> /dev/null || true
@@ -1404,6 +1410,12 @@ PY
     for d in /var/lib/$old-web /var/lib/$old /etc/$old /srv/$old; do
       [ -e "$d" ] && [ ! -e "${d/\/$old/\/$new}" ] && mv "$d" "${d/\/$old/\/$new}"
     done
+    # the mv carried the mounted volumes along; fstab must follow, or the
+    # next boot mounts them back on the old paths (only once the old tree is
+    # gone: a /srv/$new that was there before means nothing moved)
+    if [ -d /srv/$new ] && [ ! -e /srv/$old ]; then
+      python3 "$here/fstab.py" rename /etc/fstab "/srv/$old" "/srv/$new" | sed 's/^/migrate-name: fstab: /'
+    fi
     # links and files that name the old paths: units' links in each home,
     # podman's storage.conf, the pools, the projects' settings
     for h in /home/$new-*; do

@@ -4,6 +4,7 @@
 mcu        box/mcu.py        mcu.py                                 755   -
 conf       box/mcuconf.py    mcuconf.py                             644   -
 admin      box/fstab.py      fstab.py                               644   -
+admin      box/relink.py     relink.py                              644   -
 version    VERSION           VERSION                                644   -
 hw         box/hw/__init__.py    hw/__init__.py                     644   -
 hw         box/hw/__main__.py    hw/__main__.py                     644   -

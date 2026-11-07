@@ -516,5 +516,26 @@ class Throttled(unittest.TestCase):
                          (None, None))
 
 
+class QuotaLines(unittest.TestCase):
+    """config usage's quota: every pool type the project has, not only the ssd"""
+
+    def test_one_pool(self):
+        self.assertEqual(mcu.quota_lines({"used": 30 * G, "quota": 60 * G}),
+                         ["quota       30.00 GB used of  60.00 GB (50%, measured every 5 min)"])
+
+    def test_two_pools(self):
+        u = {"used": 30 * G, "quota": 60 * G,
+             "media": {"hdd": {"used": 136 * G, "quota": 202 * G}, "ssd": {"used": 30 * G, "quota": 60 * G}}}
+        self.assertEqual(mcu.quota_lines(u),
+                         ["quota ssd   30.00 GB used of  60.00 GB (50%, measured every 5 min)",
+                          "quota hdd  136.00 GB used of 202.00 GB (67%, measured every 5 min)"])
+
+    def test_no_quota(self):
+        self.assertEqual(mcu.quota_lines({}), [])
+        # a pool type without a quota is not a line of its own
+        self.assertEqual(len(mcu.quota_lines({"used": G, "quota": 2 * G, "media": {"ssd": {"used": G, "quota": 2 * G},
+                                                                                   "hdd": {"used": 0, "quota": 0}}})), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

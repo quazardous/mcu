@@ -154,7 +154,7 @@ config repo https://host/owner/repo  # where the box fetches your branches (http
 config manifest tools/bench/bench.toml   # where your manifest is in the repo (default)
 config disk 40g                      # your disk quota, unless your Benchfile sets it (default: the box's default_disk)
 config disk hdd 300g                 # room on the box's spinning disks, if it has some
-config usage                         # what fills your quota: images, caches, src, jobs
+config usage                         # what fills your quota (each pool type's, ssd and hdd): images, caches, src, jobs
 config clean images                  # drop the images nothing needs now (works while jobs run; says what it kept)
 config clean cache <name>[/<sub>]    # drop a cache, or one per-branch tree of it
 config clean src                     # drop the repository-mode checkout, once on a Benchfile

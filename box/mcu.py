@@ -4948,13 +4948,29 @@ def disk_breakdown(project):
     return out
 
 
+def quota_lines(u):
+    """config usage's quota lines from usage.json's entry: one per pool type
+    when the project has several (ssd, hdd), else the one quota"""
+    gb = lambda b: f"{b / 2**30:6.2f} GB"
+    media = {m: x for m, x in (u.get("media") or {}).items() if x.get("quota")}
+    if len(media) > 1:
+        return [f"quota {m:<4} {gb(x['used'])} used of {gb(x['quota'])} ({x['used'] / x['quota']:.0%}, measured every 5 min)"
+                for m, x in sorted(media.items(), key=lambda kv: MEDIA.index(kv[0]) if kv[0] in MEDIA else 9)]
+    if u.get("quota"):
+        return [f"quota      {gb(u['used'])} used of {gb(u['quota'])} ({u['used'] / u['quota']:.0%}, measured every 5 min)"]
+    return []
+
+
 def disk_report(project):
     """config usage: what fills the project's quota"""
     home = Path.home()
     gb = lambda b: f"{b / 2**30:6.2f} GB"
     u = disk_use(project)
-    if u:
-        print(f"quota      {gb(u['used'])} used of {gb(u['quota'])} (measured every 5 min)")
+    for line in quota_lines(u):
+        print(line)
+    # with more than one pool type, each storage says which quota it fills
+    per = disk_media(project) if len(u.get("media") or {}) > 1 else {}
+    where = lambda path: f" [{media_of(path, per)}]" if per else ""
     warn = disk_warning(project)
     if warn:
         print(f"warning    {warn}")
@@ -4969,7 +4985,7 @@ def disk_report(project):
         if c.name == ".git":
             print(f"git cache  {gb(du(c))}  ([checkout] clones, shared by the jobs)")
             continue
-        print(f"cache      {gb(du(c))}  {c.name}  (`config clean cache {c.name}`)")
+        print(f"cache      {gb(du(c))}  {c.name}{where(c)}  (`config clean cache {c.name}`)")
         if (c / ".bench-per").exists():
             for sub in sorted(x for x in c.iterdir() if x.is_dir()):
                 print(f"             {gb(du(sub))}  {c.name}/{sub.name}")

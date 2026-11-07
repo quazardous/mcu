@@ -12,6 +12,8 @@
   import QueueMode from "./lib/widgets/QueueMode.svelte";
   import PowerMenu from "./lib/widgets/PowerMenu.svelte";
   import Tabs from "./lib/widgets/Tabs.svelte";
+  import { ask } from "./lib/widgets/confirm.svelte.js";
+  import { say } from "./lib/widgets/toast.svelte.js";
   import Home from "./pages/Home.svelte";
   import Jobs from "./pages/Jobs.svelte";
   import Project from "./pages/Project.svelte";
@@ -40,6 +42,15 @@
   $effect(() => { const t = setInterval(() => (clock = Date.now() / 1000), 1000); return () => clearInterval(t); });
   async function cancelShutdown() {
     try { await post("/api/admin/shutdown", { action: "cancel" }); } catch {}
+  }
+  // the countdown skipped: the running jobs have ended, only the wait goes
+  function shutdownNow(action) {
+    const word = action === "reboot" ? "restart" : "power-off";
+    ask(action === "reboot" ? "Restart the box now?" : "Power off the box now?",
+      `The running jobs have ended; the ${word} starts at once instead of at the end of the countdown. It cannot be cancelled after this.`
+      + (action === "poweroff" ? " Powering it on again needs someone at the machine." : ""),
+      async () => { try { say((await post("/api/admin/shutdown", { action: "now" })).note); } catch (e) { say(e.message, true); } },
+      action === "poweroff" ? "power off" : null);
   }
 
   async function boot() {
@@ -118,6 +129,9 @@
       {:else if sd.step === "waiting"}waiting for {sd.running?.length || "the"} running job(s){#if sd.running?.length} ({sd.running.join(", ")}){/if}.
       {:else if sd.step === "countdown"}<b>{sd.action === "reboot" ? "restarting" : "powering off"} in {Math.max(0, Math.ceil(sd.deadline - clock))} s</b>.
       {:else}{sd.action === "reboot" ? "restarting" : "powering off"} now.{/if}
+      {#if sd.step === "countdown"}
+        <button class="link cancel" onclick={() => shutdownNow(sd.action)}>{sd.action === "reboot" ? "restart now" : "power off now"}</button>
+      {/if}
       {#if sd.step !== "reboot" && sd.step !== "poweroff"}
         <button class="link cancel" onclick={cancelShutdown}>cancel</button>
       {/if}

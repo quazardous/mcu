@@ -41,7 +41,7 @@ Everything but the UI's static files and the login needs a session
     POST /api/admin/envelope {"key", "value"|"reset"}  a limit of the envelope, written into box.toml
     POST /api/admin/cancel {"project", "id"}  cancel a queued or running job
     POST /api/admin/power {"profile": "fast"|"balanced"|"quiet"}  the CPU's power profile
-    POST /api/admin/shutdown {"action": "reboot"|"poweroff"|"cancel"}  a graceful restart or power-off
+    POST /api/admin/shutdown {"action": "reboot"|"poweroff"|"cancel"|"now"}  a graceful restart or power-off (now: skip its countdown)
     POST /api/admin/timing {"cooldown", "target", "cap_pct"}  the timing jobs' profile
     POST /api/admin/revoke {"project"}
 
@@ -988,11 +988,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200 if r.returncode == 0 else 400, {"note": (r.stdout or r.stderr).strip()})
         if path == "/api/admin/shutdown":
             action = str(data.get("action", ""))
-            if action not in ("reboot", "poweroff", "cancel"):
-                return self.send(400, {"error": "action: reboot, poweroff or cancel"})
+            if action not in ("reboot", "poweroff", "cancel", "now"):
+                return self.send(400, {"error": "action: reboot, poweroff, cancel or now"})
             r = subprocess.run(ADMIN + ["shutdown", action], capture_output=True, text=True)
             note = (r.stdout or r.stderr).strip()
-            if r.returncode == 0 and action != "cancel":
+            if r.returncode == 0 and action in ("reboot", "poweroff"):
                 note = f"{'restart' if action == 'reboot' else 'power-off'} started (task {note})"
             return self.send(200 if r.returncode == 0 else 400, {"note": note})
         if path == "/api/admin/quota":

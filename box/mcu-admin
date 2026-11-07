@@ -54,7 +54,7 @@
 #   mcu-admin timing [cooldown on|off] [target auto|<C>] [cap <pct>|none] [max <s>]
 #                                  the profile of timing jobs (timing = true)
 #   mcu-admin list               the projects and their settings
-#   mcu-admin shutdown reboot|poweroff | cancel | status
+#   mcu-admin shutdown reboot|poweroff | cancel | now | status
 #                                  a graceful restart or power-off: queue closed,
 #                                  eGPU ejected, running jobs waited for, a 60 s
 #                                  countdown; cancellable until it ends
@@ -712,7 +712,8 @@ PY
   shutdown)
     # shutdown reboot|poweroff | cancel | status: the graceful restart or
     # power-off, as a task (queue closed, eGPU ejected, running jobs waited
-    # for, a 60 s countdown), cancellable until the end of the countdown
+    # for, a 60 s countdown), cancellable until the end of the countdown;
+    # now skips what is left of the countdown
     case "${2:-}" in
       reboot|poweroff|test) exec "$lib/mcu-task" add shutdown --run "$2" ;;
       --run) [ $# -eq 3 ] || die "usage: shutdown --run reboot|poweroff"
@@ -728,8 +729,24 @@ PY
 )
         [ -n "$id" ] || die "no restart or power-off in progress"
         exec "$lib/mcu-task" cancel "$id" ;;
+      now)
+        # the countdown skipped: only once the running jobs have ended (the
+        # countdown step), so it never cuts a job short
+        pid=$(python3 - <<'PY'
+import json, pathlib
+sd = pathlib.Path("/var/lib/mcu/shutdown.json")
+step = json.loads(sd.read_text()).get("step") if sd.exists() else None
+for p in sorted(pathlib.Path("/var/lib/mcu/tasks").glob("*.json")):
+    t = json.loads(p.read_text())
+    if t["kind"] == "shutdown" and t["state"] in ("running", "waiting") and t.get("pid") and step == "countdown":
+        print(t["pid"])
+PY
+)
+        [ -n "$pid" ] || die "no countdown in progress (only a restart or power-off whose running jobs have ended can go now)"
+        kill -USR1 "$pid" || die "the shutdown task is gone"
+        echo "countdown skipped" ;;
       status) cat "$state/shutdown.json" 2>/dev/null || echo "no restart or power-off in progress" ;;
-      *) die "usage: shutdown reboot|poweroff|test | cancel | status" ;;
+      *) die "usage: shutdown reboot|poweroff|test | cancel | now | status" ;;
     esac
     ;;
   status)

@@ -693,7 +693,8 @@ def shutdown_save(st):
 def shutdown_run(action):
     """root, as a mcu-task task (mcu-admin shutdown reboot|poweroff): the
     graceful restart or power-off. The queue closes, the eGPU is ejected,
-    the running jobs end, a 60 s countdown, then systemctl. Each step prints
+    the running jobs end, a 60 s countdown (cut short by mcu-admin shutdown
+    now), then systemctl. Each step prints
     `waiting:` so the task stays cancellable; a cancel (SIGTERM) undoes what
     this sequence did: it reopens the queue it closed and re-attaches the
     GPU it ejected. shutdown.json tells the dashboard (and the next boot,
@@ -765,11 +766,24 @@ def shutdown_run(action):
 
     st.update(step="countdown", running=[], deadline=time.time() + 60)
     shutdown_save(st)
-    while (left := st["deadline"] - time.time()) > 0:
-        print(f"waiting: {word} in {int(left)} s", flush=True)
-        time.sleep(min(5, left))
+
+    # mcu-admin shutdown now (SIGUSR1): the countdown ends at once; the jobs
+    # are already done, only the wait is skipped
+    class Now(Exception):
+        pass
+
+    def now(*_):
+        raise Now
+    signal.signal(signal.SIGUSR1, now)
+    try:
+        while (left := st["deadline"] - time.time()) > 0:
+            print(f"waiting: {word} in {int(left)} s", flush=True)
+            time.sleep(min(5, left))
+    except Now:
+        print(f"waiting: {word} now, the countdown skipped (admin)", flush=True)
     # past here it can no longer be cancelled: what runs now is the stop
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
     st["step"] = action
     shutdown_save(st)
     print(f"progress: {word} now", flush=True)

@@ -1145,6 +1145,14 @@ swap), or past that a process of it is killed by the kernel. Its log says so
 ("memory limit … reached"), and its next run reserves more. To avoid that first failure, declare a realistic
 `memory`.
 
+The log's `memory peak` line, sampled from the job's cgroup every second,
+says what each figure is: the peak first is the job's anonymous memory with
+what of it went to swap, the figure the box reserves from; then the
+cgroup's own peak with the page cache (it fills up to the limit on a large
+write, at no cost), the most of mapped files (a linker's inputs: reclaimable,
+but a link slows down without them) and the swap peak. The same figures are
+in the job's `conditions.json` under `memory`.
+
 A job runs in `/work` (Benchfile) or `/src` (repository mode), with `/out`
 for its results, and no network. Exclusive pseudo-resources: `machine`
 (alone on the box) and `disk` (heavy I/O); hardware comes as resources.

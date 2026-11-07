@@ -3603,12 +3603,14 @@ def provision(project, conf, manifest, src, req, d, logf, log, finish, sched):
     finish(0)
 
 
-# the job's command, sampled from its own cgroup every 2 s (CPU time used,
-# memory in use with the page cache, its anonymous part: what the job really
-# needs) and summed up at the end (CPU, memory peak, swap, disk I/O); the
-# subshell keeps the command's exit status and `exit` inside it
+# the job's command, sampled from its own cgroup every TRACE_SECONDS (CPU
+# time used, memory in use with the page cache, its anonymous part, its
+# swapped-out part, its mapped files) and summed up at the end (CPU, memory
+# peak, swap, disk I/O); the subshell keeps the command's exit status and
+# `exit` inside it. A trace line: t cpu_usec current anon swap mapped
+TRACE_SECONDS = 1
 TRACE = """cg=/sys/fs/cgroup
-( while :; do echo "$(date +%s) $(awk '/^usage_usec/ {print $2}' $cg/cpu.stat) $(cat $cg/memory.current) $(awk '/^anon / {print $2}' $cg/memory.stat)"; sleep 2; done ) > /out/.bench-trace 2> /dev/null &
+( while :; do echo "$(date +%s) $(awk '/^usage_usec/ {print $2}' $cg/cpu.stat) $(cat $cg/memory.current) $(awk '/^anon / {a=$2} END {print a+0}' $cg/memory.stat) $(cat $cg/memory.swap.current 2> /dev/null || echo 0) $(awk '/^file_mapped / {print $2}' $cg/memory.stat)"; sleep {seconds}; done ) > /out/.bench-trace 2> /dev/null &
 tracer=$!
 (
 {command}
@@ -3625,7 +3627,7 @@ exit $rc
 
 
 def with_trace(command):
-    return TRACE.replace("{command}", command)
+    return TRACE.replace("{seconds}", str(TRACE_SECONDS)).replace("{command}", command)
 
 
 class MemWatch:
@@ -3644,7 +3646,8 @@ class MemWatch:
         while not self.done.wait(10):
             try:
                 last = self.trace.read_text().splitlines()[-1].split()
-                now = int(last[3] if len(last) > 3 else last[2])   # anonymous memory, the cache left out
+                # anonymous memory and its swapped-out part, the cache left out
+                now = int(last[3]) + (int(last[4]) if len(last) > 4 else 0) if len(last) > 3 else int(last[2])
             except (OSError, IndexError, ValueError):
                 continue
             self.peak = max(self.peak, now)
@@ -3662,15 +3665,35 @@ class MemWatch:
         self.done.set()
 
 
-def anon_peak(out):
-    """the largest anonymous memory the trace saw: what the job needs, the
-    page cache (a build writing gigabytes) left out; None without samples"""
+def trace_peaks(out):
+    """the trace's peaks: need (anonymous memory plus what of it went to
+    swap: what the job needs, the page cache of what it wrote left out),
+    anon, swap and mapped (file pages mapped by its processes, a linker's
+    inputs); {} without samples. An older trace has no swap nor mapped"""
+    peaks = {}
     try:
-        vals = [int(line.split()[3]) for line in (out / ".bench-trace").read_text().splitlines()
-                if len(line.split()) == 4]
-    except (OSError, ValueError):
-        return None
-    return max(vals) if vals else None
+        lines = (out / ".bench-trace").read_text().splitlines()
+    except OSError:
+        return peaks
+    for line in lines:
+        f = line.split()
+        if len(f) < 4:
+            continue
+        try:
+            anon = int(f[3])
+            swap = int(f[4]) if len(f) > 4 else 0
+            mapped = int(f[5]) if len(f) > 5 else 0
+        except ValueError:
+            continue
+        for k, v in (("need", anon + swap), ("anon", anon), ("swap", swap), ("mapped", mapped)):
+            peaks[k] = max(peaks.get(k, 0), v)
+    return peaks
+
+
+def anon_peak(out):
+    """what the job needed at most: its anonymous memory, swapped-out part
+    included; None without samples"""
+    return trace_peaks(out).get("need") or None
 
 
 def memory_hit(d, code, rights, log):
@@ -3686,8 +3709,7 @@ def memory_hit(d, code, rights, log):
     except (OSError, ValueError):
         events = {}
     try:
-        swapped = int((out / ".bench-swap-peak").read_text().strip())
-        (out / ".bench-swap-peak").unlink()
+        swapped = int((out / ".bench-swap-peak").read_text().strip())   # record_cost removes it
     except (OSError, ValueError):
         swapped = 0
     limit = parse_size(rights["memory"])
@@ -3725,12 +3747,27 @@ def record_cost(d, project, job, threads, log, conditions=None, rights=None, gro
         peak = int((out / ".bench-memory-peak").read_text().strip())
     except (OSError, ValueError):
         peak = None
-    # what the job needs is its anonymous memory: record that, not the
-    # cgroup's peak, which counts the page cache of what it wrote
-    anon = anon_peak(out)
+    try:
+        swap_peak = int(take(".bench-swap-peak") or 0) or None
+    except ValueError:
+        swap_peak = None
+    # what the job needs is its anonymous memory (swapped-out part
+    # included): record that, not the cgroup's peak, which counts the page
+    # cache of what it wrote
+    tp = trace_peaks(out)
+    anon = tp.get("need") or None
     if anon:
         (out / ".bench-memory-peak").write_text(f"{anon}\n")
-    record_peak(d, project, job, log, grow_to)  # reads and removes .bench-memory-peak
+    memory = {"need_peak": anon, "cgroup_peak": peak, "mapped_peak": tp.get("mapped") or None,
+              "swap_peak": max(swap_peak or 0, tp.get("swap", 0)) or None, "sample_seconds": TRACE_SECONDS,
+              **({"reserved": rights["memory_need"], "limit": parse_size(rights["memory"])} if rights else {})}
+    record_peak(d, project, job, log, grow_to, memory)  # reads and removes .bench-memory-peak
+    if conditions is not None:
+        conditions["memory"] = memory
+        try:
+            (d / "conditions.json").write_text(json.dumps(conditions, indent=1) + "\n")
+        except OSError:
+            pass
     cpu_us = int(take(".bench-cpu") or 0)
     io = take(".bench-io").split()
     samples = []
@@ -3769,7 +3806,29 @@ def record_cost(d, project, job, threads, log, conditions=None, rights=None, gro
     return cost
 
 
-def record_peak(d, project, job, log, grow_to=None):
+def memory_line(seen, m, grow_to=None):
+    """the log's memory line: what each figure is, so a client sizing its
+    `memory =` knows which to trust"""
+    gb = lambda b: f"{b / 2**30:.2f} GB"
+    line = f"memory peak {gb(seen)}" if seen else "memory peak unknown"
+    m = m or {}
+    if m.get("need_peak"):
+        line += f" anonymous incl. swap (what the job needs; sampled every {m.get('sample_seconds', TRACE_SECONDS)} s)"
+    more = []
+    if m.get("cgroup_peak"):
+        more.append(f"cgroup peak {gb(m['cgroup_peak'])} with page cache")
+    if m.get("mapped_peak"):
+        more.append(f"{gb(m['mapped_peak'])} mapped files at most")
+    if m.get("swap_peak"):
+        more.append(f"swap peak {gb(m['swap_peak'])}")
+    if more:
+        line += "; " + ", ".join(more)
+    if grow_to:
+        line += f"; the next run is sized for {gb(grow_to)}"
+    return line
+
+
+def record_peak(d, project, job, log, grow_to=None, memory=None):
     """the run's memory peak into memory.json: the job's last peaks, the
     largest of them as what its next run reserves; grow_to (a run killed at
     its limit) is recorded instead, so the next run gets more room"""
@@ -3795,8 +3854,7 @@ def record_peak(d, project, job, log, grow_to=None):
         tmp.write_text(json.dumps(data, indent=1))
         os.replace(tmp, path)
     event(kind="memory", project=project, job=job, peak=peak)
-    log(f"memory peak {(seen or peak) / 2**30:.2f} GB"
-        + (f"; the next run is sized for {peak / 2**30:.2f} GB" if grow_to else ""))
+    log(memory_line(seen or peak, memory, peak if grow_to else None))
 
 
 STEP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}\Z")

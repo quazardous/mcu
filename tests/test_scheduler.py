@@ -292,6 +292,37 @@ class MemoryHit(unittest.TestCase):
         self.assertIsNone(self.run_hit(2 * G, 0, code=137)[0])
 
 
+class MemoryPeak(unittest.TestCase):
+    """the memory line: the need counts what went to swap, and the line says
+    what each figure is"""
+
+    def trace(self, text):
+        import tempfile
+        from pathlib import Path
+        out = Path(tempfile.mkdtemp())
+        (out / ".bench-trace").write_text(text)
+        return out
+
+    def test_need_counts_swap(self):
+        out = self.trace(f"1 0 {5 * G} {2 * G} 0 {G}\n2 0 {5 * G} {2 * G} {G // 2} {3 * G}\n3 0 {G} {G} 0 0\n")
+        p = mcu.trace_peaks(out)
+        self.assertEqual(p, {"need": 2 * G + G // 2, "anon": 2 * G, "swap": G // 2, "mapped": 3 * G})
+        self.assertEqual(mcu.anon_peak(out), 2 * G + G // 2)
+
+    def test_old_trace(self):
+        out = self.trace(f"1 0 {5 * G} {2 * G}\n1 0 {5 * G}\n")
+        self.assertEqual(mcu.trace_peaks(out), {"need": 2 * G, "anon": 2 * G, "swap": 0, "mapped": 0})
+        self.assertIsNone(mcu.anon_peak(self.trace("")))
+
+    def test_line(self):
+        m = {"need_peak": int(2.4 * G), "cgroup_peak": 5 * G, "mapped_peak": int(1.8 * G),
+             "swap_peak": int(0.2 * G), "sample_seconds": 1}
+        self.assertEqual(mcu.memory_line(m["need_peak"], m),
+                         "memory peak 2.40 GB anonymous incl. swap (what the job needs; sampled every 1 s); "
+                         "cgroup peak 5.00 GB with page cache, 1.80 GB mapped files at most, swap peak 0.20 GB")
+        self.assertEqual(mcu.memory_line(2 * G, None, 3 * G), "memory peak 2.00 GB; the next run is sized for 3.00 GB")
+
+
 class Dependencies(unittest.TestCase):
     """after= / after_ok=, x:<ext_job_id>, chains: in a temporary jobs dir"""
 

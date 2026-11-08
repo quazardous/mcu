@@ -61,6 +61,7 @@ function projects() {
     quota_source: { ssd: ["Benchfile v3", "config disk", "admin"][k % 3], hdd: k === 2 ? "config disk" : "default" },
     media: { ssd: { used: (9 + 4 * k) * G, quota: [30, 40, 80][k % 3] * G }, hdd: { used: k === 2 ? 120 * G : 0, quota: k === 2 ? 200 * G : 0 } },
     used: (9 + 4 * k) * G, quota: [30, 40, 80][k % 3] * G, tree: true, pool: "data", units: units(p, k), key: true,
+    last_seen: p === "gamma" ? now() - 3 * 86400 : now() - 600,   // gamma: idle, out of the graph's legend
     parts: { images: (3 + k) * G, tmp_storage: 1 * G, kept_storage: (7 + 3 * k) * G, src: 0.5 * G, old_results: 0.3 * G,
              recent_results: 0.1 * G, volumes: 0, reclaimable: (4.3 + k) * G, purgeable: (12 + 4 * k) * G, measured: now() - 120 },
   }]));

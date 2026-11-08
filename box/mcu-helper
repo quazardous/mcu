@@ -1482,6 +1482,28 @@ def timing_tick():
         os.replace(tmp, ipath)
 
 
+def last_seen(previous):
+    """each project's latest job event (queued, started, done, refused): the
+    tail of events.jsonl, kept at its max in usage.json, so the dashboard
+    knows a project's last activity however far back"""
+    seen = {p: v.get("last_seen") for p, v in previous.items() if isinstance(v, dict) and v.get("last_seen")}
+    try:
+        with open(STATE / "events.jsonl", "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(f.tell() - 2 * 2**20, 0))
+            tail = f.read().splitlines()[1:]
+    except OSError:
+        return seen
+    for line in tail:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("kind") in ("queued", "started", "done", "refused") and e.get("project") and e.get("t"):
+            seen[e["project"]] = max(seen.get(e["project"], 0), e["t"])
+    return seen
+
+
 def usage(with_parts=False):
     """each project's disk use and quota, for the dashboard and the quota
     warnings: from its timer, or a project's `config clean` to refresh it.
@@ -1501,6 +1523,7 @@ def usage(with_parts=False):
     except (OSError, ValueError):
         previous = {}
     data = {}
+    seen = last_seen(previous)
     for pp in sorted((STATE / "projects").glob("*.json")):
         project, user = pp.stem, f"mcu-{pp.stem}"
         try:
@@ -1517,7 +1540,7 @@ def usage(with_parts=False):
         # used and quota at the top stay the ssd's, as before the pool types
         data[project] = {"used": media["ssd"]["used"], "quota": q, "media": media, "pool": conf.get("pool"),
                          "units": [{k: u[k] for k in ("unit", "kind", "pool", "bytes")} for u in units],
-                         "tree": any(u["pool"] != "home" for u in units)}
+                         "tree": any(u["pool"] != "home" for u in units), "last_seen": seen.get(project)}
         if True:
             if with_parts and project_exists(project):
                 data[project]["parts"] = parts(project)

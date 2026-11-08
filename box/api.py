@@ -194,6 +194,9 @@ def projects():
             "pool": usage.get(p, {}).get("pool"),
             "units": usage.get(p, {}).get("units"),
             "key": key.exists(),
+            # its latest job event (usage.json, every 5 min): the graph's legend
+            # leaves out the projects idle for a day
+            "last_seen": usage.get(p, {}).get("last_seen"),
         }
     return result
 

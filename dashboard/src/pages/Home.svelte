@@ -58,8 +58,10 @@
   const lanes = $derived([...jobLanes.map((t) => ({ key: t, label: `T${t}` })),
                           ...exclusiveRes.map((n) => ({ key: n, label: n.toUpperCase(), special: true, color: RES[n] || "#9fe8ff" })),
                           { key: "machine", label: "MACHINE", special: true, color: RES.machine }]);
-  // the legend: every project the box knows, in its colour
-  const projectNames = $derived(Object.keys(s?.projects || {}).sort());
+  // the legend: the projects with a job now, or one in the last 24 h, in their colour
+  const projectNames = $derived(Object.entries(s?.projects || {}).filter(([p, v]) =>
+    [...(s?.running || []), ...(s?.queue || []), ...(s?.deps || [])].some((e) => e.project === p)
+    || (v.last_seen && Date.now() / 1000 - v.last_seen < 86400)).map(([p]) => p).sort());
   const runningProjects = $derived(new Set((s?.running || []).map((r) => r.project)));
   const height = $derived(TOP + lanes.length * ROW + PAD);
   const queueW = $derived(Math.max(160, Math.min(360, (width - LABEL) * 0.22)));

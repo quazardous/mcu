@@ -20,6 +20,8 @@ button, input, select { font: inherit; color: var(--fg); background: var(--panel
   border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
 button { cursor: pointer; }
 button.danger { color: var(--bad); }
+button.primary { font-weight: 700; border-color: var(--fg); }
+button:disabled { opacity: .45; cursor: default; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--mute); font-weight: 500; }

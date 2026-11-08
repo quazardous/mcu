@@ -1,6 +1,8 @@
 <script>
   // the queue's mode in the header: a pill (open, paused, closed) that opens
   // a menu to change it; pausing or closing asks a reason, shown to the agents
+  import { outside } from "./outside.js";
+  import { say } from "./toast.svelte.js";
   import { live, refreshState } from "../live.svelte.js";
   import { post } from "../api.js";
   import { ask } from "./confirm.svelte.js";
@@ -23,12 +25,12 @@
         await post("/api/admin/queue", { mode: m, reason: reason.trim(), until: until.trim() });
         menu = false; reason = ""; until = ""; error = "";
         await refreshState();
-      } catch (e) { error = e.message; }
+      } catch (e) { error = e.message; say(e.message, true); }   // the menu may be closed by then
     });
   }
 </script>
 
-<div class="qm">
+<div class="qm" use:outside={() => (menu = false)}>
   <button class="pill {mode}" onclick={() => (menu = !menu)} aria-expanded={menu}
           title={mode === "open" ? "the queue is open" : `the queue is ${mode}: ${res.hold || res.maintenance || ""}`}>
     queue: {mode} ▾

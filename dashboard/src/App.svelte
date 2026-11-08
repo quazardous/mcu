@@ -8,6 +8,9 @@
   import { tasks, loadTasks } from "./lib/admin.svelte.js";
   import Login from "./pages/Login.svelte";
   import ConfirmDialog from "./lib/widgets/ConfirmDialog.svelte";
+  import InviteDialog from "./lib/widgets/InviteDialog.svelte";
+  import { outside } from "./lib/widgets/outside.js";
+  import { openInvite } from "./lib/widgets/invite.svelte.js";
   import Toast from "./lib/widgets/Toast.svelte";
   import QueueMode from "./lib/widgets/QueueMode.svelte";
   import PowerMenu from "./lib/widgets/PowerMenu.svelte";
@@ -75,7 +78,7 @@
   <div class="top">
   <header class:joined={["machine", "settings", "", "home", "jobs"].includes(page) || projectPage}>
     <a href="#/" class="brand" title="mcu: multiple compute unit"><img src="/logo.svg" alt="" class="logo" />mcu{#if live.state?.host} <span class="host">· {live.state.host.split(".")[0]}</span>{/if}</a>
-    <div class="menu">
+    <div class="menu" use:outside={() => (menu = false)}>
       <button onclick={() => (menu = !menu)}>Projects ▾</button>
       {#if menu}
         <div class="drop" role="menu">
@@ -83,6 +86,7 @@
           {#each projects as p}
             <a href="#/p/{p}" onclick={() => (menu = false)} style:color={color(p)}>{p}</a>
           {/each}
+          <button class="link invite" role="menuitem" onclick={() => { menu = false; openInvite(); }}>+ invite a project…</button>
         </div>
       {/if}
     </div>
@@ -163,6 +167,7 @@
 {/if}
 
 <ConfirmDialog />
+<InviteDialog />
 <Toast />
 
 <style>
@@ -188,5 +193,7 @@
   .drop { position: absolute; top: 34px; left: 0; background: var(--panel); border: 1px solid var(--line);
           border-radius: 8px; padding: 6px; display: grid; min-width: 160px; box-shadow: 0 6px 18px rgb(0 0 0 / .15); }
   .drop a { padding: 5px 8px; font-weight: 600; }
+  .drop .invite { text-align: left; padding: 7px 8px 5px; margin-top: 4px; border-top: 1px solid var(--line); border-radius: 0;
+                 color: var(--fg); font-weight: 600; white-space: nowrap; }
   button.link { border: none; background: none; color: var(--mute); }
 </style>

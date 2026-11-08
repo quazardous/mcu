@@ -58,9 +58,9 @@ function projects() {
     repo: `https://git.example.org/${p}/${p}`, benchfile: 3 + k, benchfiles: k === 0 ? { "feature-x": 1 } : {},
     abouts: Object.fromEntries(JOBS[p].map((j) => [j, `the ${j} job`])),
     disk: k === 1 ? "40g" : "", admin_disk: k === 2 ? "80g" : null, disk_hdd: k === 2 ? "200g" : "", admin_disk_hdd: null,
-    quota_source: { ssd: ["Benchfile v3", "config disk", "admin"][k], hdd: k === 2 ? "config disk" : "default" },
-    media: { ssd: { used: (9 + 4 * k) * G, quota: [30, 40, 80][k] * G }, hdd: { used: k === 2 ? 120 * G : 0, quota: k === 2 ? 200 * G : 0 } },
-    used: (9 + 4 * k) * G, quota: [30, 40, 80][k] * G, tree: true, pool: "data", units: units(p, k), key: true,
+    quota_source: { ssd: ["Benchfile v3", "config disk", "admin"][k % 3], hdd: k === 2 ? "config disk" : "default" },
+    media: { ssd: { used: (9 + 4 * k) * G, quota: [30, 40, 80][k % 3] * G }, hdd: { used: k === 2 ? 120 * G : 0, quota: k === 2 ? 200 * G : 0 } },
+    used: (9 + 4 * k) * G, quota: [30, 40, 80][k % 3] * G, tree: true, pool: "data", units: units(p, k), key: true,
     parts: { images: (3 + k) * G, tmp_storage: 1 * G, kept_storage: (7 + 3 * k) * G, src: 0.5 * G, old_results: 0.3 * G,
              recent_results: 0.1 * G, volumes: 0, reclaimable: (4.3 + k) * G, purgeable: (12 + 4 * k) * G, measured: now() - 120 },
   }]));
@@ -224,6 +224,8 @@ export async function demoPost(path, body = {}) {
     return { note: `demo: shutdown ${body.action} (nothing restarts)` };
   }
   if (path === "/api/admin/invite") {
+    // a new project shows up in the demo until the page reloads
+    if (!PROJECTS.includes(body.project)) { PROJECTS.push(body.project); JOBS[body.project] = []; }
     return { project: body.project, host: "demo-box", key: "-----BEGIN OPENSSH PRIVATE KEY-----\n(demo: not a key)\n-----END OPENSSH PRIVATE KEY-----" };
   }
   return { note: `demo: ${path.replace("/api/admin/", "")} ${JSON.stringify(body)} (not applied: no box behind the demo)` };

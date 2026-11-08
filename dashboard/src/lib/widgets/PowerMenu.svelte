@@ -7,6 +7,7 @@
   import { ask } from "./confirm.svelte.js";
   import { say } from "./toast.svelte.js";
   import { cancelShutdown, shutdownNow } from "./shutdown.js";
+  import { outside } from "./outside.js";
   let open = $state(false);
   // a restart or power-off in progress: the menu offers what applies to it
   const sd = $derived(live.state?.shutdown);
@@ -26,7 +27,7 @@
   }
 </script>
 
-<div class="power">
+<div class="power" use:outside={() => (open = false)}>
   <button class="link" title="restart or power off the box" disabled={stopping} onclick={() => (open = !open)}>⏻ ▾</button>
   {#if open && !stopping}
     <div class="drop" role="menu">

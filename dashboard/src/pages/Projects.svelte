@@ -3,9 +3,7 @@
   // version, what runs and waits now, the last run; a row opens the project
   import { gb, color } from "../lib/api.js";
   import { live } from "../lib/live.svelte.js";
-  import { invite } from "../lib/admin.svelte.js";
-  import KeyPanel from "../sections/KeyPanel.svelte";
-  let name = $state("");
+  import { openInvite } from "../lib/widgets/invite.svelte.js";
   const P = $derived(live.state?.projects || {});
   const active = (p, list) => (live.state?.[list] || []).filter((e) => e.project === p).length;
   const lastRun = (p) => {
@@ -20,16 +18,12 @@
 
 <div class="head">
   <h1>Projects</h1>
-  <form class="row" onsubmit={(e) => { e.preventDefault(); invite(name); name = ""; }}>
-    <input bind:value={name} placeholder="project name" aria-label="project name" pattern="[a-z][a-z0-9-]{'{'}1,20{'}'}" required />
-    <button title="creates the project and shows its key once; on an existing project, replaces its key">invite</button>
-  </form>
+  <button class="primary" onclick={openInvite}>+ invite a project</button>
 </div>
-<KeyPanel />
 {#if !Object.keys(P).length}
   <div class="panel first">
     <p><b>No project yet.</b> A project is one user on this box with its own key, storage and queue share.
-      Invite one above (or <span class="mono">mcu-admin invite &lt;project&gt;</span>): its key is shown once, for the project's agent.</p>
+      Invite one with <b>+ invite a project</b> (or <span class="mono">mcu-admin invite &lt;project&gt;</span>): its key is shown once, for the project's agent.</p>
     <p class="mute">The agent then starts with <span class="mono">ssh … docs agents</span> (the guide, <span class="mono">docs/USING.md</span>, served by the box);
       the box's own settings are under <a href="#/settings">Settings</a>.</p>
   </div>

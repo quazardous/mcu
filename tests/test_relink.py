@@ -30,14 +30,14 @@ class Relink(unittest.TestCase):
         return p
 
     def test_moves_only_old_prefixes(self):
-        a = self.link("raw-corpus", "/srv/bench/hdd/helios/volumes/raw-corpus")
-        b = self.link("jobs", "/home/bench-helios/x")
+        a = self.link("assets", "/srv/bench/hdd/myapp/volumes/assets")
+        b = self.link("jobs", "/home/bench-myapp/x")
         c = self.link("benchmarks", "/srv/benchmarks/x")      # a sibling, not under /srv/bench/
         d = self.link("relative", "../bench/x")
         e = self.link("already", "/srv/mcu/projects/probe/volumes/probe-test")
         changed = relink.relink(self.top, 1, PAIRS)
-        self.assertEqual(os.readlink(a), "/srv/mcu/hdd/helios/volumes/raw-corpus")
-        self.assertEqual(os.readlink(b), "/home/mcu-helios/x")
+        self.assertEqual(os.readlink(a), "/srv/mcu/hdd/myapp/volumes/assets")
+        self.assertEqual(os.readlink(b), "/home/mcu-myapp/x")
         self.assertEqual(os.readlink(c), "/srv/benchmarks/x")
         self.assertEqual(os.readlink(d), "../bench/x")
         self.assertEqual(os.readlink(e), "/srv/mcu/projects/probe/volumes/probe-test")

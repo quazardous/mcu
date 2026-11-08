@@ -35,5 +35,6 @@
   .veil { position: fixed; inset: 0; background: rgb(0 0 0 / 0.45); display: grid; place-items: center; z-index: 50; padding: 16px; }
   .ask { max-width: 460px; width: 100%; border-color: var(--bad); box-shadow: 0 10px 40px rgb(0 0 0 / 0.35); }
   .ask h2 { margin-top: 0; }
+  .ask input { display: block; width: 100%; box-sizing: border-box; margin: 4px 0 14px; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 </style>

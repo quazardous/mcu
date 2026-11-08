@@ -81,7 +81,7 @@ function state() {
       until: null, queue_by: queue.by, status: queue.mode === "closed" ? "maintenance" : "ok", problems: [] },
     envelope, envelope_defaults: ENV_DEFAULTS, envelope_set: Object.keys(envSet),
     power: { profile: "balanced", profiles: { fast: 65, balanced: 45, quiet: 28 }, limit_w: 45 },
-    shutdown: null,
+    shutdown: demoShutdown(),
     pools: {
       data: { ...fs("/srv/data", "/dev/nvme0n1p3", 900, 610), path: "/srv/data/mcu", default: true, media: "ssd", budget: 600 * G, projects: PROJECTS, quotas: 150 * G },
       bulk: { ...fs("/srv/bulk", "/dev/sda1", 1800, 1500), path: "/srv/bulk/mcu", default: false, media: "hdd", budget: 1200 * G, projects: ["gamma"], quotas: 200 * G },
@@ -157,6 +157,21 @@ const HARDWARE = { updated: now(), features: [
   { key: "virt", feature: "running in a VM", state: "absent", detail: "bare metal", fix: null },
 ] };
 
+// a restart or power-off, played out: 8 s waiting for the running job, then
+// the 60 s countdown; "now" ends it, "cancel" undoes it (nothing restarts)
+let shutdown = null;
+function demoShutdown() {
+  if (!shutdown) return null;
+  const t = now() - shutdown.at;
+  if (shutdown.now || t > 68) {
+    // the demo box "comes back" a few seconds later
+    if (now() - (shutdown.now || shutdown.at + 68) > 6) { shutdown = null; return null; }
+    return { ...shutdown, step: shutdown.action };
+  }
+  return t < 8 ? { ...shutdown, step: "waiting", running: ["alpha/test"] }
+               : { ...shutdown, step: "countdown", running: [], deadline: shutdown.at + 68 };
+}
+
 export async function demoGet(path) {
   const [p, qs] = path.split("?");
   const q = new URLSearchParams(qs || "");
@@ -201,6 +216,13 @@ export async function demoPost(path, body = {}) {
     Object.assign(queue, { mode: body.mode, reason: body.reason || null, by: body.mode === "open" ? null : "dashboard" });
     return { note: `demo: queue ${body.mode}` };
   }
+  if (path === "/api/admin/shutdown") {
+    if (body.action === "cancel") shutdown = null;
+    else if (body.action === "now") shutdown = shutdown && { ...shutdown, now: now() };
+    else shutdown = { action: body.action, at: now() };
+    boxChanged?.();
+    return { note: `demo: shutdown ${body.action} (nothing restarts)` };
+  }
   if (path === "/api/admin/invite") {
     return { project: body.project, host: "demo-box", key: "-----BEGIN OPENSSH PRIVATE KEY-----\n(demo: not a key)\n-----END OPENSSH PRIVATE KEY-----" };
   }
@@ -208,11 +230,15 @@ export async function demoPost(path, body = {}) {
 }
 
 // the live stream: a sample every 2 s, nothing else happens
+let boxChanged = null;
 export function demoConnect(on, onStatus) {
   onStatus(true);
+  boxChanged = () => on("box", { kind: "box" });
   const timer = setInterval(() => {
     const t = now(), w = Math.sin(t / 60) + 1;
     on("samples", [[t, 30 + 20 * w, 40 + 5 * w]]);
+    // a shutdown in progress moves on by itself: say so, as the box would
+    if (shutdown) boxChanged();
   }, 2000);
-  return () => clearInterval(timer);
+  return () => { clearInterval(timer); boxChanged = null; };
 }

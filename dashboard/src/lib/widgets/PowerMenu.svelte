@@ -6,8 +6,11 @@
   import { live } from "../live.svelte.js";
   import { ask } from "./confirm.svelte.js";
   import { say } from "./toast.svelte.js";
+  import { cancelShutdown, shutdownNow } from "./shutdown.js";
   let open = $state(false);
-  const busy = $derived(!!live.state?.shutdown);
+  // a restart or power-off in progress: the menu offers what applies to it
+  const sd = $derived(live.state?.shutdown);
+  const stopping = $derived(sd && (sd.step === "reboot" || sd.step === "poweroff"));
   const ACTIONS = {
     reboot: { label: "Restart", title: "Restart the box?" },
     poweroff: { label: "Power off", title: "Power off the box?" },
@@ -24,12 +27,22 @@
 </script>
 
 <div class="power">
-  <button class="link" title="restart or power off the box" disabled={busy} onclick={() => (open = !open)}>⏻ ▾</button>
-  {#if open}
+  <button class="link" title="restart or power off the box" disabled={stopping} onclick={() => (open = !open)}>⏻ ▾</button>
+  {#if open && !stopping}
     <div class="drop" role="menu">
-      {#each Object.entries(ACTIONS) as [k, a] (k)}
-        <button class="link" role="menuitem" onclick={() => pick(k)}>{a.label}</button>
-      {/each}
+      {#if sd}
+        {#if sd.step === "countdown"}
+          <button class="link" role="menuitem" onclick={() => { open = false; shutdownNow(sd.action); }}>
+            {sd.action === "reboot" ? "Restart now" : "Power off now"}</button>
+        {:else}
+          <span class="note">now: once the running jobs end</span>
+        {/if}
+        <button class="link" role="menuitem" onclick={() => { open = false; cancelShutdown(); }}>Cancel</button>
+      {:else}
+        {#each Object.entries(ACTIONS) as [k, a] (k)}
+          <button class="link" role="menuitem" onclick={() => pick(k)}>{a.label}</button>
+        {/each}
+      {/if}
     </div>
   {/if}
 </div>
@@ -39,6 +52,7 @@
   .power > button { font-size: 16px; color: var(--fg); }
   .drop { position: absolute; top: 30px; right: 0; background: var(--panel); border: 1px solid var(--line);
           border-radius: 6px; padding: 4px; display: flex; flex-direction: column; z-index: 20; min-width: 110px; }
-  .drop button { text-align: left; padding: 5px 8px; font-weight: 600; color: var(--fg); }
+  .drop button { text-align: left; padding: 5px 8px; font-weight: 600; color: var(--fg); white-space: nowrap; }
   .drop button:hover { background: var(--free); }
+  .note { padding: 5px 8px; color: var(--mute); font-size: 12px; white-space: nowrap; }
 </style>

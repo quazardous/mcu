@@ -1729,6 +1729,31 @@ def substitute(text, params):
     return re.sub(r"\$\{([a-z_][a-z0-9_]*)(:-([A-Za-z0-9._/@+-]*))?\}", one, text)
 
 
+BUILD_ERROR_RE = re.compile(r"\[RPM\].*fail|Unpack error|^\s*(error|Error|ERROR)[:\s]|\bfailed\b.*\bstatus\b|"
+                            r"No match for argument|nothing provides|conflicts with")
+
+
+def build_failure_lines(text, tail=40):
+    """what a failed image build leaves in the job's log: its last lines, and
+    before them every line that names an error (an rpm unpack, a missing
+    package), wherever it was, so the cause is never cut off"""
+    lines = text.strip().splitlines()
+    head = [line for line in lines[:-tail] if BUILD_ERROR_RE.search(line)][-40:]
+    return head + (["  …"] if head else []) + lines[-tail:]
+
+
+def canonical_user():
+    """USER and LOGNAME from the uid's own name (mcu-<project>), whatever
+    login alias the client used (bench-<project> after a rename): rootless
+    podman finds the subuid range by $USER, and without it falls back to a
+    namespace with one uid, where packages with system users fail to install"""
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return
+    os.environ["USER"] = os.environ["LOGNAME"] = name
+
+
 def podman_build(args, log, project=None, limits=()):
     """podman build, its output in the job's log when it fails (quiet, it
     prints nothing else); `limits`: the threads and memory the scheduler gave"""
@@ -1741,7 +1766,7 @@ def podman_build(args, log, project=None, limits=()):
         env["TMPDIR"] = str(Path(m.group(1)).parent / "tmp")
     r = subprocess.run(["podman", "build", "-q", *limits] + args, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        for line in (r.stdout + r.stderr).strip().splitlines()[-40:]:
+        for line in build_failure_lines(r.stdout + r.stderr):
             log(f"  {line}")
         if project and re.search(r"quota exceeded|no space left", r.stdout + r.stderr, re.I):
             log("the project's disk quota is full: " + (disk_warning(project) or "see `config usage`"))
@@ -5623,6 +5648,7 @@ def prune():
 
 
 if __name__ == "__main__":
+    canonical_user()
     mode = sys.argv[1] if len(sys.argv) > 1 else "entry"
     if mode == "run":
         run_job(sys.argv[2])

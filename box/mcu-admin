@@ -1273,6 +1273,18 @@ PY
         say ok "volume index $vols: every link leads to its volume"
       fi
     fi
+    # each project's rootless podman: its user namespace maps the subuid
+    # range (a pause process started under another login name, a bench-*
+    # alias, maps one uid only: packages with system users fail to install)
+    for pid in $(pgrep -x catatonit 2> /dev/null); do
+      u="$(ps -o user= -p "$pid" 2> /dev/null | tr -d ' ')"
+      case "$u" in mcu-*) ;; *) continue ;; esac
+      if [ "$(wc -l < "/proc/$pid/uid_map" 2> /dev/null)" -lt 2 ]; then
+        say missing "podman of $u maps one uid only" "when none of its jobs runs: sudo -u $u XDG_RUNTIME_DIR=/run/user/\$(id -u $u) podman system migrate"
+      else
+        say ok "podman of $u maps its subuid range"
+      fi
+    done
     # what init installs and runs
     [ -x "$lib/mcu.py" ] && [ -x /usr/local/bin/mcu-job ] && say ok "mcu installed in $lib" \
       || say missing "mcu's files" "make install (or mcu-admin init from a checkout)"

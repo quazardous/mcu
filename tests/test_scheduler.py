@@ -523,6 +523,36 @@ class First(unittest.TestCase):
         self.assertTrue(any(line.startswith("first: check") for line in logs))
 
 
+class BuildLog(unittest.TestCase):
+    """a failed image build keeps its error lines wherever they are, and
+    every command runs as the account's own name, not a login alias"""
+
+    def test_error_lines_kept(self):
+        out = ["Installing: x"] * 100 + ["[RPM] unpacking of archive failed on file /var/lib/geoclue: cpio: chown failed",
+                                         "Unpack error: geoclue2-0:2.8.2-1.fc44.x86_64"] + ["  Installing: y"] * 60
+        lines = mcu.build_failure_lines("\n".join(out))
+        self.assertIn("Unpack error: geoclue2-0:2.8.2-1.fc44.x86_64", lines)
+        self.assertTrue(any(line.startswith("[RPM]") for line in lines))
+        self.assertEqual(len(lines), 2 + 1 + 40)
+        self.assertEqual(mcu.build_failure_lines("a\nb"), ["a", "b"])
+
+    def test_canonical_user(self):
+        import os
+        import pwd
+        saved = {k: os.environ.get(k) for k in ("USER", "LOGNAME")}
+        try:
+            os.environ["USER"] = os.environ["LOGNAME"] = "bench-alias"
+            mcu.canonical_user()
+            name = pwd.getpwuid(os.getuid()).pw_name
+            self.assertEqual((os.environ["USER"], os.environ["LOGNAME"]), (name, name))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class Dependencies(unittest.TestCase):
     """after= / after_ok=, x:<ext_job_id>, chains: in a temporary jobs dir"""
 

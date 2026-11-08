@@ -2,6 +2,7 @@
 """The scheduler's rule (may_start) and the queue's estimates (queue_view),
 without root and without a box: python3 -m unittest discover tests"""
 import importlib.util
+import json
 import time
 import os
 import unittest
@@ -413,6 +414,113 @@ class Seeds(unittest.TestCase):
         (self.cache / "feat_y").mkdir()
         names = [n for _, n, _ in mcu.tmp_subs("p")]
         self.assertEqual(names, ["target/feat_y"])
+
+
+class First(unittest.TestCase):
+    """first = [...]: a job's prerequisites from its Benchfile, submitted
+    with it (or the identical one already in flight), reused per commit"""
+
+    MANIFEST = {"jobs": {"check": {"command": "c"},
+                         "test": {"command": "t", "first": [{"job": "check", "pass": ["branch"]}]}}}
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name)
+        names = ("jobs_dir", "project_conf", "project_name", "pick_benchfile", "load_toml", "create_job",
+                 "recent_events")
+        saved = {k: getattr(mcu, k) for k in names}
+        self.addCleanup(lambda: [setattr(mcu, k, v) for k, v in saved.items()])
+        mcu.jobs_dir = lambda: self.jobs
+        mcu.project_name = lambda: "myapp"
+        mcu.project_conf = lambda p: {"benchfile": 3}
+        mcu.pick_benchfile = lambda conf, params: (None, 3)
+        mcu.load_toml = lambda path: self.MANIFEST
+        self.created = []
+
+        def create_job(kind, branch, name, params=None, deps=None, ext=None, prio=None, extra=None):
+            d = self.jobs / f"20261108-1000{len(self.created):02d}-abcd"
+            d.mkdir()
+            (d / "request").write_text(json.dumps({"kind": kind, "name": name, "params": params or {}, **(extra or {})}))
+            self.created.append((name, params, extra))
+            return d
+        mcu.create_job = create_job
+
+    def test_check_first(self):
+        ok = {"check": {}, "test": {"first": [{"job": "check", "pass": ["branch"]}]}}
+        said = []
+        mcu.check_first(ok, said.append)
+        self.assertIn("job test: first check (passes branch)", said[0])
+        for bad in ([{"job": "nope"}], [{"job": "test"}], [{"job": "check", "pass": ["Bad-Name"]}],
+                    [{"job": "check", "when": "x"}], "check", [{"job": ["check"]}]):
+            with self.assertRaises(mcu.Refused, msg=repr(bad)):
+                mcu.check_first({"check": {}, "test": {"first": bad}})
+        with self.assertRaises(mcu.Refused):   # one level only
+            mcu.check_first({"lint": {}, "check": {"first": [{"job": "lint"}]}, "test": {"first": [{"job": "check"}]}})
+
+    def test_first_of(self):
+        self.assertEqual(mcu.first_of("test", {"branch": "x", "crate": "c"}), [("check", {"branch": "x"})])
+        self.assertEqual(mcu.first_of("check", {"branch": "x"}), [])
+
+    def test_submit_first_then_attach(self):
+        deps = {"after": [], "after_ok": []}
+        extra = mcu.submit_first("test", {"branch": "x"}, deps, None)
+        self.assertEqual(self.created, [("check", {"branch": "x"}, {"prereq": True})])
+        pre = extra["first"][0]
+        self.assertEqual(deps["after_ok"], [pre])
+        # a second job while that check is still queued: it waits on the same one
+        deps2 = {"after": [], "after_ok": []}
+        self.assertEqual(mcu.submit_first("test", {"branch": "x"}, deps2, None), {"first": [pre]})
+        self.assertEqual(len(self.created), 1)
+        # once it ended, a new one is submitted (it may reuse the result by commit)
+        (self.jobs / pre / "status").write_text("exit 0\n")
+        mcu.submit_first("test", {"branch": "x"}, {"after_ok": []}, None)
+        self.assertEqual(len(self.created), 2)
+
+    def test_first_none(self):
+        params, deps = {"branch": "x", "first": "none"}, {"after_ok": []}
+        self.assertEqual(mcu.submit_first("test", params, deps, None), {})
+        self.assertEqual((params, deps, self.created), ({"branch": "x"}, {"after_ok": []}, []))
+
+    def test_passed_before(self):
+        done = lambda i, **kw: dict({"kind": "done", "id": i, "project": "myapp", "job": "check", "status": 0,
+                                     "params": {"branch": "x"}, "commits": {"app": "abc"}, "benchfile": 3}, **kw)
+        mcu.recent_events = lambda: [done("a"), done("b", status=101), done("c", commits={"app": "def"}),
+                                     done("d", reused="a")]
+        find = lambda commits, **kw: mcu.passed_before("myapp", "check", kw.get("params", {"branch": "x"}),
+                                                       commits, kw.get("bf", (None, 3)), kw.get("pushed", ""))
+        self.assertEqual(find({"app": "abc"}), "a")        # the run that really passed, through its reuse
+        self.assertEqual(find({"app": "def"}), "c")
+        self.assertIsNone(find({"app": "fff"}))             # another commit
+        self.assertIsNone(find({"app": "abc"}, params={"branch": "y"}))
+        self.assertIsNone(find({"app": "abc"}, bf=(None, 4)))     # another Benchfile version
+        self.assertIsNone(find({"app": "abc"}, pushed="1234"))    # other pushed code
+        self.assertIsNone(find({}))                          # no checkout: nothing to compare
+
+    def test_a_failed_first_names_it(self):
+        pre = self.jobs / "20261108-090000-aaaa"
+        pre.mkdir()
+        (pre / "request").write_text(json.dumps({"name": "check"}))
+        (pre / "status").write_text("exit 101\n")
+
+        class Sched:
+            def block(self, e): pass
+            def waits_for(self, i, dep): pass
+            def release(self, i): pass
+
+        class Finished(Exception):
+            pass
+
+        def finish(code, **extra):
+            raise Finished(code, extra)
+        logs = []
+        with self.assertRaises(Finished) as cm:
+            mcu.wait_deps("20261108-100000-cccc", "myapp", {"name": "test", "after_ok": [pre.name], "first": [pre.name]},
+                          logs.append, finish, Sched())
+        self.assertEqual(cm.exception.args[0], mcu.EX_DEPENDENCY)
+        self.assertIn("check 20261108-090000-aaaa failed (exit 101)", cm.exception.args[1]["reason"])
+        self.assertTrue(any(line.startswith("first: check") for line in logs))
 
 
 class Dependencies(unittest.TestCase):

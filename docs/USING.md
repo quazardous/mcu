@@ -772,6 +772,30 @@ status x:gate-x | wait x:gate-x | cancel x:gate-x | fetch x:gate-x
 - `cancel <id>` says what happens to the jobs that wait on it: `after_ok` ones
   end with exit 79, `after` ones go on.
 
+**Prerequisites in the Benchfile: `first`.** A job can name what must pass
+before it, so `run test-crate …` alone runs the check first:
+
+```toml
+[jobs.test-crate]
+first = [{ job = "check", pass = ["branch", "crate"] }]
+```
+
+- `run test-crate branch=x crate=y` submits `check branch=x crate=y`, then
+  `test-crate` waiting on it with `after_ok` (holding nothing meanwhile). If
+  the identical check (same job, same passed parameters) is already queued or
+  running, `test-crate` waits on that one instead of submitting another.
+- `pass` lists the run's parameters given to the prerequisite; the others
+  take its defaults. It uses the same Benchfile as the job.
+- **Once per commit:** a prerequisite that finds, after its fetch, an
+  earlier successful run with the same parameters, Benchfile and commits
+  (and the same pushed code) ends at once with exit 0 ("already passed at …
+  by <id>: not run again").
+- If it fails, the job does not run and ends with **exit 79**; its log says
+  `first: check <id> failed (exit 101)`. `status` shows each prerequisite and
+  its state.
+- One level: a prerequisite has no `first` of its own. `first=none` on a run
+  skips them (`first` is a reserved parameter name).
+
 A **chain** submits several jobs at once, each its own job (id, log, `out/`),
 linked by step names; every line is checked before any job is created:
 
@@ -1060,7 +1084,7 @@ one of the box's:
 | 3 | the box could not prepare the job: a checkout, a fetch, a prefetch or a service failed | the log says which; often the network or a branch that doesn't exist |
 | 75 | not now: maintenance, the queue closed, the GPU absent, not enough disk, or the box restarted under the job | retry later; never a test failure |
 | 78 | this box can never run it as asked (a resource it doesn't have, a capability no resource provides) | change the Benchfile, or ask the admin |
-| 79 | a dependency (`after_ok=`) did not succeed; the job never ran | fix and rerun the dependency |
+| 79 | a dependency (`after_ok=`, or a Benchfile `first`) did not succeed; the job never ran | fix and rerun the dependency |
 | 124 | the job reached its `timeout` and was stopped | raise `timeout` (up to the envelope's `timeout_max`), or make the job shorter |
 | 130 | cancelled (`cancel`, or a newer job took its `ext_job_id`) | |
 | 137 | the kernel killed it: almost always its memory limit | declare more `memory`; the log says when the limit was hit |

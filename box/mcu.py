@@ -1516,7 +1516,7 @@ def wait_deps(job_id, project, req, log, finish, sched):
                  "branch": " ".join(f"{k}={v}" for k, v in params.items()), "since": time.time(),
                  "ext": req.get("ext_job_id"), "priority": req.get("priority"),
                  "after": req.get("after", []), "after_ok": req.get("after_ok", []), "waiting_for": None})
-    log("waiting for " + ", ".join(f"{i} ({kind})" for kind, i in deps))
+    log("waiting for " + ", ".join(f"{i} ({'first' if i in req.get('first', []) else kind})" for kind, i in deps))
     said = None
     while True:
         pending = []
@@ -1533,8 +1533,14 @@ def wait_deps(job_id, project, req, log, finish, sched):
             if status is None:
                 pending.append((kind, dep))
             elif kind == "after_ok" and status_code(status) != 0:
-                log(f"dependency {dep} failed ({status}): not run (exit {EX_DEPENDENCY})")
-                finish(EX_DEPENDENCY, reason=f"dependency {dep} failed")
+                try:
+                    what = json.loads((jobs_dir() / found / "request").read_text()).get("name", "")
+                except (OSError, ValueError):
+                    what = ""
+                first = found in req.get("first", [])
+                log(f"{'first: ' if first else 'dependency '}{what + ' ' if what else ''}{dep} failed ({status}): "
+                    f"not run (exit {EX_DEPENDENCY})")
+                finish(EX_DEPENDENCY, reason=f"{what + ' ' if what else ''}{dep} failed ({status})")
         if not pending:
             break
         if pending[0] != said:
@@ -3320,6 +3326,39 @@ class FetchFailed(Exception):
     pass
 
 
+def pushed_sig():
+    """what the project pushed (mcu-job push), as a short fingerprint: names,
+    sizes and times of its files; "" when nothing is pushed"""
+    pushed = Path.home() / "pushed"
+    h = hashlib.sha256()
+    n = 0
+    for root, dirs, files in os.walk(pushed) if pushed.exists() else []:
+        dirs.sort()
+        for f in sorted(files):
+            try:
+                st = os.lstat(os.path.join(root, f))
+            except OSError:
+                continue
+            h.update(f"{os.path.relpath(os.path.join(root, f), pushed)} {st.st_size} {int(st.st_mtime)}\n".encode())
+            n += 1
+    return h.hexdigest()[:16] if n else ""
+
+
+def passed_before(project, job, params, commits, benchfile, pushed):
+    """the id of an earlier successful run of this job with the same
+    parameters, Benchfile and commits (and the same pushed code), or None"""
+    if not commits:
+        return None
+    label, version = benchfile
+    for e in reversed(recent_events()):
+        if e.get("kind") == "done" and e.get("project") == project and e.get("job") == job \
+                and e.get("status") == 0 and e.get("params", {}) == params and e.get("commits") == commits \
+                and e.get("benchfile") == version and e.get("benchfile_label") == label \
+                and e.get("pushed", "") == pushed:
+            return e.get("reused") or e.get("id")
+    return None
+
+
 def push_pushed(work):
     # local code pushed by the project (mcu-job push <name>) goes in first
     pushed = Path.home() / "pushed"
@@ -3492,6 +3531,17 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
     except FetchFailed:
         log("fetch failed")
         finish(3)
+    pushed = pushed_sig()
+    if req.get("prereq"):
+        # a prerequisite (first =) that already passed at these commits,
+        # with the same parameters and Benchfile, is not run again
+        prior = passed_before(project, req["name"], req.get("params", {}), commits, plan["benchfile"], pushed)
+        if prior:
+            log(f"already passed at {', '.join(f'{r} {c[:9]}' for r, c in commits.items()) or 'the same sources'} "
+                f"by {prior}: not run again")
+            label, version = plan["benchfile"]
+            finish(0, commits=commits, benchfile=version, **({"benchfile_label": label} if label else {}),
+                   pushed=pushed, reused=prior)
     extra = []
     if req["kind"] == "provision":
         base = VOLUMES / req["name"]
@@ -3565,7 +3615,7 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
         sm = {"problem": str(e)[:200]}
     label, version = plan["benchfile"]
     finish(code, commits=commits, benchfile=version, **({"benchfile_label": label} if label else {}),
-           cost=cost, summary={k: sm[k] for k in ("tests", "failures", "errors") if k in sm}, **why)
+           pushed=pushed, cost=cost, summary={k: sm[k] for k in ("tests", "failures", "errors") if k in sm}, **why)
 
 
 def debug_v5(project, conf, job_name, params):
@@ -3996,7 +4046,7 @@ def check_deps(project, deps, steps=(), new=1):
     return notes
 
 
-def create_job(kind, branch, name, params=None, deps=None, ext=None, prio=None):
+def create_job(kind, branch, name, params=None, deps=None, ext=None, prio=None, extra=None):
     """a job's directory and its runner, in the background; the job's dir.
     With an ext_job_id, the new job takes it: from now on that name means
     this job (status, wait, fetch, cancel, and the jobs waiting on it); a
@@ -4013,7 +4063,7 @@ def create_job(kind, branch, name, params=None, deps=None, ext=None, prio=None):
     (d / "request").write_text(json.dumps({"kind": kind, "branch": branch, "name": name,
                                            "params": params or {}, **{k: v for k, v in deps.items() if v},
                                            **({"ext_job_id": ext} if ext else {}),
-                                           **({"priority": prio} if prio else {})}) + "\n")
+                                           **({"priority": prio} if prio else {}), **(extra or {})}) + "\n")
     replaced = None
     if ext:
         index = jobs_dir() / ".ext"
@@ -4047,12 +4097,93 @@ def submit_warnings():
             print(f"mcu-job: warning: {warn}", file=sys.stderr, flush=True)
 
 
+def first_of(name, params):
+    """the prerequisites a Benchfile job declares (first = [{ job, pass }]),
+    for this run: [(job, its parameters)]; the parameters it passes come
+    from the run's, and the prerequisite uses the same Benchfile"""
+    try:
+        conf = project_conf(project_name())
+        if not conf.get("benchfile"):
+            return []
+        label, version = pick_benchfile(conf, dict(params))
+    except Refused:
+        return []   # the job's own submission says what is wrong
+    try:
+        job = load_toml(benchfile_path(label, version)).get("jobs", {}).get(name) or {}
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    out = []
+    for f in job.get("first") or []:
+        pp = {k: params[k] for k in f.get("pass", []) if k in params}
+        if label is not None:
+            pp["benchfile"] = label
+        out.append((f["job"], pp))
+    return out
+
+
+def in_flight(name, params):
+    """a job of the project with this name and these parameters, queued or
+    running (not ended), or None: a prerequisite to wait on rather than
+    submit twice"""
+    for d in sorted(jobs_dir().glob("2*"), reverse=True)[:300]:
+        if (d / "status").exists():
+            continue
+        try:
+            r = json.loads((d / "request").read_text())
+        except (OSError, ValueError):
+            continue
+        if r.get("kind") == "job" and r.get("name") == name and r.get("params", {}) == params:
+            return d.name
+    return None
+
+
+def submit_first(name, params, deps, prio):
+    """before a job: its Benchfile's prerequisites (first =), each submitted,
+    or the identical one already queued or running; the job then waits for
+    them with after_ok. `first=none` in the run's parameters skips them.
+    Returns the extra request fields (the prerequisites' ids)"""
+    if params.pop("first", None) == "none":
+        return {}
+    ids = []
+    for pre, pp in first_of(name, params):
+        found = in_flight(pre, pp)
+        if found:
+            print(f"mcu-job: first: {pre} {found}, already queued or running: waiting on it", flush=True)
+        else:
+            found = create_job("job", None, pre, pp, {}, None, prio, extra={"prereq": True}).name
+        ids.append(found)
+        if found not in deps.setdefault("after_ok", []):
+            deps["after_ok"].append(found)
+    return {"first": ids} if ids else {}
+
+
+def first_view(req):
+    """a job's prerequisites (first =) as status shows them: job, id, state,
+    and the earlier run it reused when it did not run again"""
+    out = []
+    for i in req.get("first", []):
+        d = jobs_dir() / i
+        try:
+            name = json.loads((d / "request").read_text()).get("name")
+        except (OSError, ValueError):
+            name = None
+        reused = None
+        try:
+            m = re.search(r"already passed at .* by (\S+): not run again", (d / "log").read_text(errors="replace"))
+            reused = m.group(1) if m else None
+        except OSError:
+            pass
+        out.append({"job": name, "id": i, "state": state_of(d) if d.is_dir() else "gone", "reused": reused})
+    return out
+
+
 def submit(kind, branch, name, params=None, deps=None, ext=None, prio=None):
     deps = deps or {}
     for note in check_deps(project_name(), deps):
         print(f"mcu-job: {note}", flush=True)
     submit_warnings()
-    return follow(create_job(kind, branch, name, params, deps, ext, prio))
+    extra = submit_first(name, params, deps, prio) if kind == "job" and params is not None else {}
+    return follow(create_job(kind, branch, name, params, deps, ext, prio, **({"extra": extra} if extra else {})))
 
 
 def chain(lines, detach=False, prio=None):
@@ -4094,7 +4225,8 @@ def chain(lines, detach=False, prio=None):
         # a step named by its ext_job_id when it has one: a later resubmission
         # of that step takes its place for the steps waiting on it
         resolved = {k: [ids.get(i, i) for i in v] for k, v in deps.items()}
-        d = create_job("job", None, job, params, resolved, ext, step_prio)
+        extra = submit_first(job, params, resolved, step_prio)
+        d = create_job("job", None, job, params, resolved, ext, step_prio, **({"extra": extra} if extra else {}))
         ids[name] = f"x:{ext}" if ext else d.name
         dirs.append(d)
     print("mcu-job: chain: " + " ".join(f"{s[0]}={d.name}" for s, d in zip(steps, dirs)), flush=True)
@@ -4249,12 +4381,15 @@ def entry():
                 if b["id"] == jid:
                     place.update({k: b.get(k) for k in ("after", "after_ok", "waiting_for")},
                                  eta_start=view.get("blocked", {}).get(jid, {}).get("eta_start"))
+            first = first_view(read_json_file(d / "request"))
             if args[1:] == ["--json"]:
                 print(json.dumps({"id": d.name, "ext_job_id": read_json_file(d / "request").get("ext_job_id"),
-                                  "state": state, "summary": sm,
+                                  "state": state, "summary": sm, "first": first or None,
                                   "held": held or None, "queue": place or None}, indent=1))
                 return 0
             print(f"{state} ({held_text()})" if held else state)
+            for f in first:
+                print(f"first: {f['job']} {f['id']} {f['state']}" + (f" (passed before: {f['reused']})" if f.get("reused") else ""))
             if "waiting_for" in place:
                 print(f"waiting for dependencies: {place['waiting_for'] or 'checking'}"
                       + "".join(f"; {k}={','.join(place[k])}" for k in ("after", "after_ok") if place.get(k))
@@ -4804,6 +4939,33 @@ def refuse_if_benchfile_sets_disk(conf, media):
                       f"([project] disk), or remove it from the Benchfile to set it here", topic="quotas")
 
 
+def check_first(nj, say=lambda m: None):
+    """each job's first = [{ job, pass }], at upload: another job of the
+    Benchfile, without a first of its own (one level), parameter names;
+    Refused, nothing stored, otherwise"""
+    for jname, job in nj.items():
+        first = job.get("first")
+        if first is None:
+            continue
+        where = f"[jobs.{jname}] first"
+        if not isinstance(first, list) or not all(isinstance(f, dict) for f in first):
+            raise Refused(f"{where}: a list of {{ job = \"<name>\", pass = [\"<param>\", ...] }}; nothing stored",
+                          topic="deps")
+        for f in first:
+            extra = sorted(set(f) - {"job", "pass"})
+            if extra:
+                raise Refused(f"{where}: unknown keys {', '.join(extra)} (known: job, pass); nothing stored", topic="deps")
+            pre, passed = f.get("job"), f.get("pass", [])
+            if not isinstance(pre, str) or pre not in nj or pre == jname:
+                raise Refused(f"{where}: {pre!r} is not another job of this Benchfile; nothing stored", topic="deps")
+            if nj[pre].get("first"):
+                raise Refused(f"{where}: {pre} has its own first; one level only; nothing stored", topic="deps")
+            if not isinstance(passed, list) or not all(isinstance(k, str) and PARAM_KEY_RE.match(k) for k in passed):
+                raise Refused(f"{where}: pass is a list of parameter names; nothing stored", topic="deps")
+        say(f"job {jname}: first " + ", ".join(f"{f['job']}" + (f" (passes {', '.join(f.get('pass', []))})" if f.get("pass") else "")
+                                              for f in first) + "; skipped per run with first=none")
+
+
 def benchfile_plan(project, conf, parsed, env, label=None):
     """everything an upload would change, checked before anything is stored
     (the whole Benchfile is refused if one part is above the envelope);
@@ -4864,6 +5026,7 @@ def benchfile_plan(project, conf, parsed, env, label=None):
             raise Refused(f"[jobs.{jname}] services: {', '.join(unknown)} not in [services]; nothing stored")
         if names:
             say(f"job {jname}: services {', '.join(names)}, in its pod for the job's duration, removed when it ends")
+    check_first(nj, say)
     unused = sorted(set(svcs) - {n for job in nj.values() for n in job.get("services", [])})
     if unused:
         say(f"[services] {', '.join(unused)}: no job lists it")

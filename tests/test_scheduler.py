@@ -553,6 +553,36 @@ class BuildLog(unittest.TestCase):
                     os.environ[k] = v
 
 
+class Substitute(unittest.TestCase):
+    """a Benchfile's ${...}: the run's parameters, as a POSIX shell would"""
+
+    def test_forms(self):
+        sub = mcu.substitute
+        cmd = "nextest -p ${crate} ${test:+--test ${test}} ${filter:-}"
+        self.assertEqual(sub(cmd, {"crate": "api", "test": "admin"}), "nextest -p api --test admin ")
+        self.assertEqual(sub(cmd, {"crate": "api", "test": ""}), "nextest -p api  ")
+        # not a parameter: left for the shell, which expands it to nothing too
+        self.assertEqual(sub(cmd, {"crate": "api"}), "nextest -p api ${test:+--test ${test}} ")
+        self.assertEqual(sub("${a:-x ${b:-y}}", {}), "x y")
+        self.assertEqual(sub("${a:-x ${b:-y}}", {"b": "z"}), "x z")
+        self.assertEqual(sub("${a:-x}", {"a": ""}), "x")          # empty takes the default, as in a shell
+        self.assertEqual(sub("${branch:-main}", {"branch": "feat/x"}), "feat/x")
+
+    def test_the_shell_keeps_its_own(self):
+        sub = mcu.substitute
+        text = 't=${test:-}; run ${t:+--test $t} ${#x} ${x#/w/} ${HOME} $plain'
+        self.assertEqual(sub(text, {"test": "admin"}), 't=admin; run ${t:+--test $t} ${#x} ${x#/w/} ${HOME} $plain')
+
+    def test_refused(self):
+        with self.assertRaises(mcu.Refused):
+            mcu.substitute("-p ${crate}", {})
+        with self.assertRaises(mcu.Refused):
+            mcu.substitute("${test:+--test ${test}", {"test": "a"})
+        with self.assertRaises(mcu.Refused):
+            mcu.unclosed_refs({"jobs": {"j": {"command": "echo ${a:-b"}}})
+        mcu.unclosed_refs({"jobs": {"j": {"command": "echo ${a:+x ${a}} ${#y}"}}})
+
+
 class Dependencies(unittest.TestCase):
     """after= / after_ok=, x:<ext_job_id>, chains: in a temporary jobs dir"""
 

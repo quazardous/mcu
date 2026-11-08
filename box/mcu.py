@@ -1716,17 +1716,80 @@ def benchfile_name(label, version):
     return f"Benchfile {label} v{version}" if label else f"Benchfile v{version}"
 
 
+PARAM_REF_RE = re.compile(r"([a-z_][a-z0-9_]*)(?:(:[-+])(.*))?\Z", re.S)
+
+
+def ref_end(text, i):
+    """the index of the } that closes the ${ at i (nesting counted), or -1"""
+    depth, j = 0, i
+    while j < len(text):
+        if text.startswith("${", j):
+            depth += 1
+            j += 2
+            continue
+        if text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
 def substitute(text, params):
-    """${name} and ${name:-default} from the run's parameters; an unknown
-    name without a default is refused rather than left empty"""
-    def one(m):
-        name, default = m.group(1), m.group(3)
-        if name in params:
-            return params[name]
-        if default is not None:
-            return default
-        raise Refused(f"parameter {name} is not set (run <job> {name}=...)")
-    return re.sub(r"\$\{([a-z_][a-z0-9_]*)(:-([A-Za-z0-9._/@+-]*))?\}", one, text)
+    """the run's parameters in a Benchfile string, as a POSIX shell would:
+    ${name}, ${name:-word} (the value when set and not empty, else word) and
+    ${name:+word} (word when the value is set and not empty, else nothing;
+    left for the shell when name is not a parameter of the run, a shell
+    variable of the command); word may hold spaces and other references. A ${name} that is not set,
+    without a default, is refused rather than left empty. Any other ${...}
+    (${#x}, ${x#y}, ${HOME}) is left for the shell"""
+    out, i = [], 0
+    while True:
+        k = text.find("${", i)
+        if k < 0:
+            out.append(text[i:])
+            return "".join(out)
+        end = ref_end(text, k)
+        if end < 0:
+            raise Refused(f"unclosed ${{ in {text[k:k + 40]!r}", topic="benchfile")
+        out.append(text[i:k])
+        m = PARAM_REF_RE.match(text[k + 2:end])
+        if not m:
+            out.append(text[k:end + 1])          # the shell's own
+        else:
+            name, op, word = m.group(1), m.group(2), m.group(3)
+            value = params.get(name)
+            if op is None:
+                if value is None:
+                    raise Refused(f"parameter {name} is not set (run <job> {name}=...)")
+                out.append(value)
+            elif op == ":-":
+                out.append(value if value else substitute(word, params))
+            elif value is None:
+                # not a parameter of this run: a shell variable of the command
+                # (t=...; ${t:+--test $t}), or unset, which the shell also
+                # expands to nothing
+                out.append(text[k:end + 1])
+            else:
+                out.append(substitute(word, params) if value else "")
+        i = end + 1
+
+
+def unclosed_refs(data, where="the Benchfile"):
+    """the Benchfile's strings with a ${ that never closes, refused at upload"""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            unclosed_refs(v, f"{where} {k}")
+    elif isinstance(data, list):
+        for v in data:
+            unclosed_refs(v, where)
+    elif isinstance(data, str):
+        k = data.find("${")
+        while k >= 0:
+            end = ref_end(data, k)
+            if end < 0:
+                raise Refused(f"{where}: unclosed ${{ in {data[k:k + 40]!r}; nothing stored", topic="benchfile")
+            k = data.find("${", k + 2)
 
 
 BUILD_ERROR_RE = re.compile(r"\[RPM\].*fail|Unpack error|^\s*(error|Error|ERROR)[:\s]|\bfailed\b.*\bstatus\b|"
@@ -4824,6 +4887,7 @@ def config(args):
         for name in parsed["jobs"]:
             if not NAME_RE.match(name):
                 raise Refused(f"bad job name {name!r}")
+        unclosed_refs(parsed)
         changes = benchfile_plan(project, conf, parsed, env, label)
         before = conf.get("benchfile") if label is None else conf.get("benchfiles", {}).get(label)
         try:

@@ -280,6 +280,19 @@ Run it with parameters, which fill the `${...}` (values limited to
 run test branch=my-feature lib=fix-x
 ```
 
+Three forms, as in a POSIX shell, and the word may hold spaces and other
+references:
+
+| | |
+|---|---|
+| `${name}` | the value; the run is refused when it is not given |
+| `${name:-word}` | the value when given and not empty, else `word` |
+| `${name:+word}` | `word` when the value is given and not empty, else nothing: `${test:+--test ${test}}` |
+
+A `${name:+…}` whose name is not a parameter of the run is left for the
+shell (`t=${test:-}; … ${t:+--test $t}` works too), and so is any other
+form (`${#x}`, `${x#y}`, `${HOME}`). An unclosed `${` is refused at upload.
+
 Each run records the parameters and the commit of every git repository found
 under `/work` after the fetch.
 

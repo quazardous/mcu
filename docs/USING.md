@@ -322,11 +322,19 @@ target = { about = "cargo targets, one per branch", lock = true, seed = "main" }
 
 The first time a job mounts `target/wip-x`, it starts as a copy of
 `target/main`: a reflink copy where the disk allows it (XFS, btrfs: instant,
-and the blocks stay shared until rewritten), a plain copy elsewhere. It is
-skipped while a running job mounts the seed. The quota counts the copy in full:
-when the seed is bigger than your room left on its pool, the new sub starts
-empty, and the job's log says so ("not seeded: … doesn't fit in your hdd
-quota").
+and the blocks stay shared until rewritten), a plain copy elsewhere.
+
+While a running job writes the seed, a new sub copies the seed's
+**snapshot** instead: `target/.seed-main`, a reflink copy the box takes each
+time a job that mounted the seed ends well (on a pool with reflink only).
+`storage list` shows it, it goes with its seed, and nothing mounts it.
+Without a snapshot yet, the new sub starts empty.
+
+The quota counts a copy in full. When the room left on its pool is short,
+the box first evicts your least recently used tmp subs there (never a seed,
+its snapshot, or a sub a queued or running job mounts). If even that is not
+enough, the new sub starts empty, and the job's log says so ("not seeded: …
+doesn't fit in your hdd quota").
 The box never evicts a seed to make room (only your `storage rm` drops it):
 without it, every new branch would start cold.
 

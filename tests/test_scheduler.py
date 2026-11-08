@@ -323,6 +323,98 @@ class MemoryPeak(unittest.TestCase):
         self.assertEqual(mcu.memory_line(2 * G, None, 3 * G), "memory peak 2.00 GB; the next run is sized for 3.00 GB")
 
 
+class Seeds(unittest.TestCase):
+    """a new sub starts from its seed, or from the seed's snapshot while a
+    job writes the seed; room is made for the copy by evicting old subs"""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.cache = self.home / "cache" / "target"
+        (self.cache / "main").mkdir(parents=True)
+        (self.cache / "main" / "lib.rlib").write_text("main now")
+        (self.cache / ".bench-per").touch()
+        (self.cache / ".bench-tmp").touch()
+        self.state, self.media = {"running": []}, {}
+        saved = {k: getattr(mcu, k) for k in ("read_state_json", "disk_media", "project_name", "seed_subs", "event")}
+        self.events = []
+        self.addCleanup(lambda: [setattr(mcu, k, v) for k, v in saved.items()])
+        self.addCleanup(self.tmp.cleanup)
+        mcu.read_state_json = lambda name: self.state if name == "state.json" else {}
+        mcu.disk_media = lambda project: self.media
+        mcu.project_name = lambda: "p"
+        mcu.seed_subs = lambda project: {"target/main"}
+        mcu.event = lambda **e: self.events.append(e)
+        self.saved_home = mcu.Path.home
+        mcu.Path.home = classmethod(lambda cls: self.home)
+        self.addCleanup(lambda: setattr(mcu.Path, "home", self.saved_home))
+
+    def seed(self, sub):
+        logs = []
+        (self.cache / sub).mkdir()
+        mcu.seed_sub("target", sub, "main", logs.append)
+        return logs
+
+    def test_idle_seed_is_copied(self):
+        self.seed("feat_x")
+        self.assertEqual((self.cache / "feat_x" / "lib.rlib").read_text(), "main now")
+
+    def test_busy_seed_copies_its_snapshot(self):
+        (self.cache / ".seed-main").mkdir()
+        (self.cache / ".seed-main" / "lib.rlib").write_text("main at the snapshot")
+        self.state = {"running": [{"project": "p", "job": "release", "subs": ["target/main"]}]}
+        logs = self.seed("feat_x")
+        self.assertEqual((self.cache / "feat_x" / "lib.rlib").read_text(), "main at the snapshot")
+        self.assertIn("copying its snapshot", logs[0])
+
+    def test_busy_seed_without_snapshot_starts_empty(self):
+        self.state = {"running": [{"project": "p", "job": "release", "subs": ["target/main"]}]}
+        logs = self.seed("feat_x")
+        self.assertEqual(list((self.cache / "feat_x").iterdir()), [])
+        self.assertIn("no snapshot yet", logs[0])
+
+    def test_room_is_made_by_evicting_old_subs(self):
+        import os
+        old = self.cache / "feat_old"
+        old.mkdir()
+        (old / "big").write_bytes(b"x" * 8192)
+        os.utime(old, (1, 1))
+        size = mcu.du(self.cache / "main")
+        # the copy fits only once feat_old is gone; the snapshot and the
+        # seed are never evicted
+        (self.cache / ".seed-main").mkdir()
+        self.media = {"ssd": {"used": 100_000, "quota": 100_000 + size - 1, "mounts": ["/"]}}
+        logs = self.seed("feat_x")
+        self.assertFalse(old.exists())
+        self.assertTrue((self.cache / ".seed-main").exists())
+        self.assertEqual((self.cache / "feat_x" / "lib.rlib").read_text(), "main now")
+        self.assertTrue(any("evicted storage target/feat_old" in line for line in logs))
+
+    def test_snapshot_after_a_job(self):
+        logs = []
+        mcu.snapshot_seeds("p", ["target/main", "target/feat_x"], logs.append)
+        snap = self.cache / ".seed-main"
+        # a pool without reflink takes none (a full copy would cost the
+        # seed's size on disk); either way nothing half-made is left
+        if snap.exists():
+            self.assertEqual((snap / "lib.rlib").read_text(), "main now")
+            self.assertIn("seed snapshot taken", logs[-1])
+        else:
+            self.assertIn("no seed snapshot taken", logs[-1])
+        self.assertEqual(sorted(p.name for p in self.cache.iterdir() if p.name.startswith(".seed-")),
+                         [".seed-main"] if snap.exists() else [])
+        # not a seed: no snapshot
+        self.assertFalse((self.cache / ".seed-feat_x").exists())
+
+    def test_snapshots_are_not_evictable(self):
+        (self.cache / ".seed-main").mkdir()
+        (self.cache / "feat_y").mkdir()
+        names = [n for _, n, _ in mcu.tmp_subs("p")]
+        self.assertEqual(names, ["target/feat_y"])
+
+
 class Dependencies(unittest.TestCase):
     """after= / after_ok=, x:<ext_job_id>, chains: in a temporary jobs dir"""
 

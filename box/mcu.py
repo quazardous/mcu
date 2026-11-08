@@ -1977,7 +1977,7 @@ def tmp_subs(project, protect=(), keep=()):
         for sub in c.iterdir():
             name = f"{c.name}/{sub.name}"
             if sub.is_dir() and not sub.is_symlink() and name not in protect and name not in keep \
-                    and sub.name not in keep and name not in seeds:
+                    and sub.name not in keep and name not in seeds and not sub.name.startswith(SNAP):
                 out.append((sub.stat().st_mtime, name, sub))
     return sorted(out)
 
@@ -2949,11 +2949,81 @@ def empty_storage_dir(path):
 SEEDED = {}   # pool type -> bytes this run's seeds copied: already part of its learned need
 
 
+SNAP = ".seed-"   # <storage>/.seed-<sub>: a seed's snapshot, taken when a job that wrote it ends
+
+
+def snapshot_seeds(project, subs, log):
+    """after a job: each seed sub it mounted (target/main) is snapshotted,
+    a reflink copy at <storage>/.seed-<sub>, so a new sub can start from a
+    consistent seed while a later job writes the seed itself. Skipped on a
+    pool without reflink (a full copy would cost the seed's size on disk)
+    and when the quota has no room for it (it counts in full)"""
+    home = Path.home() / "cache"
+    seeds = seed_subs(project)
+    for name in subs:
+        if name not in seeds:
+            continue
+        base, _, sub = name.partition("/")
+        src, snap = home / base / sub, home / base / f"{SNAP}{sub}"
+        if not src.is_dir() or not any(src.iterdir()):
+            continue
+        busy = [e["job"] for e in read_state_json("state.json").get("running", [])
+                if e.get("project") == project and name in e.get("subs", []) and e.get("pid") != os.getpid()]
+        if busy:
+            continue
+        per = disk_media(project)
+        x = per.get(media_of(src, per)) or {}
+        size = du(src)
+        old = du(snap) if snap.is_dir() else 0
+        if x.get("quota") and size - old > x["quota"] - x["used"]:
+            log(f"storage {name}: no seed snapshot taken ({size / 2**30:.1f} GB doesn't fit in the quota left)")
+            continue
+        new, gone = snap.with_name(snap.name + ".new"), snap.with_name(snap.name + ".old")
+        for d in (new, gone):
+            shutil.rmtree(d, ignore_errors=True)
+        t0 = time.time()
+        r = subprocess.run(["cp", "-a", "--reflink=always", f"{src}/.", str(new)], capture_output=True, text=True,
+                           env={**os.environ, "LC_ALL": "C"})
+        if r.returncode != 0:
+            shutil.rmtree(new, ignore_errors=True)
+            log(f"storage {name}: no seed snapshot taken ({r.stderr.strip()[:200] or 'the copy failed'})")
+            continue
+        if snap.exists():
+            snap.rename(gone)
+        new.rename(snap)
+        os.utime(snap)
+        shutil.rmtree(gone, ignore_errors=True)
+        log(f"storage {name}: seed snapshot taken in {time.time() - t0:.1f} s, for new subs while {sub} is in use")
+
+
+def seed_room(project, base, sub, src, size, log):
+    """room in the quota for a seed's copy (it counts in full): when it is
+    short, the least recently used tmp subs on that pool go first, never a
+    seed, its snapshot, or a sub a queued or running job mounts; the room
+    left after it"""
+    per = disk_media(project)
+    media = media_of(src, per)
+    x = per.get(media) or {}
+    if not x.get("quota"):
+        return None, media
+    room = x["quota"] - x["used"]
+    if room >= size:
+        return room, media
+    protect = in_use_subs(project) | {f"{base}/{sub}"}
+    here = [path for _, _, path in tmp_subs(project, protect) if media_of(path, per) == media]
+    if room + sum(du(path) for path in here) < size:
+        return room, media
+    log(f"storage {base}: its seed needs {size / 2**30:.1f} GB, {max(room, 0) / 2**30:.1f} GB left on {media}: "
+        "evicting tmp storage")
+    return evict(project, size, protect, log, media=media), media
+
+
 def seed_sub(base, sub, seed, log):
     """a new sub-directory of a storage starts as a copy of its seed sub
     (storage `seed = "main"`): a reflink copy on XFS or btrfs, so it
     is instant and shares the disk until rewritten (the quota still counts
-    it whole); skipped while a running job mounts the seed"""
+    it whole). While a running job mounts the seed, its snapshot (taken
+    when the last job that wrote it ended) is copied instead"""
     home = Path.home() / "cache"
     src = home / base / seed
     if seed == sub or not src.is_dir() or not any(src.iterdir()):
@@ -2961,19 +3031,23 @@ def seed_sub(base, sub, seed, log):
     busy = [e["job"] for e in read_state_json("state.json").get("running", [])
             if e.get("project") == project_name() and f"{base}/{seed}" in e.get("subs", [])]
     if busy:
-        log(f"storage {base}/{sub}: starts empty (its seed {seed} is in use by {', '.join(busy)})")
-        return
+        snap = home / base / f"{SNAP}{seed}"
+        if not snap.is_dir() or not any(snap.iterdir()):
+            log(f"storage {base}/{sub}: starts empty (its seed {seed} is in use by {', '.join(busy)}, "
+                "and has no snapshot yet)")
+            return
+        log(f"storage {base}/{sub}: its seed {seed} is in use by {', '.join(busy)}: "
+            f"copying its snapshot ({time.strftime('%F %H:%M', time.localtime(snap.stat().st_mtime))})")
+        src = snap
     # room first: on XFS a reflinked copy shares its blocks but counts in
     # full against the project's quota, so a seed bigger than the room left
-    # on its pool cannot be copied (the clone fails, as a plain copy would)
-    per = disk_media(project_name())
-    media = media_of(src, per)
-    x = per.get(media) or {}
+    # on its pool cannot be copied (the clone fails, as a plain copy would);
+    # unused tmp subs are evicted to make it
     size = du(src)
-    room = x.get("quota", 0) - x.get("used", 0)
-    if x.get("quota") and size > room:
+    room, media = seed_room(project_name(), base, sub, src, size, log)
+    if room is not None and size > room:
         log(f"storage {base}/{sub}: not seeded: {base}/{seed} ({size / 2**30:.1f} GB) doesn't fit in your "
-            f"{media} quota ({max(room, 0) / 2**30:.1f} GB left); it starts empty")
+            f"{media} quota ({max(room, 0) / 2**30:.1f} GB left, even after evicting); it starts empty")
         return
     t0 = time.time()
     r = subprocess.run(["cp", "-a", "--reflink=auto", f"{src}/.", str(home / base / sub)], capture_output=True, text=True,
@@ -2987,7 +3061,8 @@ def seed_sub(base, sub, seed, log):
         (home / base / sub).mkdir(parents=True, exist_ok=True)
         return
     SEEDED[media] = SEEDED.get(media, 0) + size
-    log(f"storage {base}/{sub}: seeded from {seed} in {time.time() - t0:.1f} s (a reflink copy where the disk allows)")
+    origin = f"{seed}'s snapshot" if src.name.startswith(SNAP) else seed
+    log(f"storage {base}/{sub}: seeded from {origin} in {time.time() - t0:.1f} s (a reflink copy where the disk allows)")
 
 
 def resolve_caches(rights, manifest, params, log=lambda m: None):
@@ -3470,6 +3545,12 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
             storage_ends(project, rights["ends"], d.name, log, trim_cmd)
         except Exception as e:   # the storage's housekeeping never fails the job
             log(f"storage ends: {e}")
+    if code == 0:
+        # a run that ended well leaves its seeds consistent: snapshot them
+        try:
+            snapshot_seeds(project, entry["subs"], log)
+        except Exception as e:   # never fails the job either
+            log(f"seed snapshot: {e}")
     if req["kind"] == "provision":
         if code != 0:
             shutil.rmtree(new, ignore_errors=True)
@@ -5085,6 +5166,10 @@ def storage(args):
             subs = sorted(x for x in c.iterdir() if x.is_dir()) if (c / ".bench-per").exists() else []
             tmp = (c / ".bench-tmp").exists() or declared.get(c.name, {}).get("tmp", False)
             for d in subs or [c]:
+                if d.name.startswith(SNAP):
+                    rows.append((f"{c.name}/{d.name}", du(d), d.stat().st_mtime, tmp, c.name in declared,
+                                 f"snapshot of {d.name[len(SNAP):]}, for new subs while it is in use"))
+                    continue
                 info = life_info(d)
                 life = info.get("life") or life_of(declared.get(c.name, {}))
                 rows.append((c.name + (f"/{d.name}" if subs else ""), du(d), d.stat().st_mtime, tmp,
@@ -5296,6 +5381,11 @@ def storage_housekeeping(project):
             continue
         targets = [x for x in c.iterdir() if x.is_dir()] if (c / ".bench-per").exists() else [c]
         for t in targets:
+            if t.name.startswith(SNAP):
+                # a snapshot goes with its seed
+                if not (c / t.name[len(SNAP):].removesuffix(".new").removesuffix(".old")).is_dir():
+                    shutil.rmtree(t, ignore_errors=True)
+                continue
             info = life_info(t)
             life = info.get("life")
             name = c.name + (f"/{t.name}" if t != c else "")

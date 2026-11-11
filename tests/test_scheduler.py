@@ -409,6 +409,35 @@ class Seeds(unittest.TestCase):
         # not a seed: no snapshot
         self.assertFalse((self.cache / ".seed-feat_x").exists())
 
+    def snapshot_with_room(self, spare, old_snapshot=True):
+        """a seed, maybe an old snapshot of the same size, and a quota with
+        `spare` bytes left; the logs of taking the snapshot"""
+        if old_snapshot:
+            (self.cache / ".seed-main").mkdir()
+            (self.cache / ".seed-main" / "lib.rlib").write_text("main now")
+        self.media = {"ssd": {"used": 100_000, "quota": 100_000 + spare, "mounts": ["/"]}}
+        logs = []
+        mcu.snapshot_seeds("p", ["target/main"], logs.append)
+        return logs
+
+    def test_snapshot_drops_the_old_one_first_when_only_that_fits(self):
+        logs = self.snapshot_with_room(mcu.du(self.cache / "main") - 1)
+        self.assertIn("the old seed snapshot goes first", logs[0])
+
+    def test_snapshot_evicts_unused_subs_when_needed(self):
+        import os
+        old = self.cache / "feat_old"
+        old.mkdir()
+        (old / "big").write_bytes(b"x" * 20000)
+        os.utime(old, (1, 1))
+        logs = self.snapshot_with_room(0, old_snapshot=False)
+        self.assertFalse(old.exists())
+        self.assertTrue(any("evicted storage target/feat_old" in line for line in logs))
+
+    def test_snapshot_skipped_says_the_quota(self):
+        logs = self.snapshot_with_room(0, old_snapshot=False)
+        self.assertRegex(logs[-1], r"no seed snapshot taken: .* GB doesn't fit in your ssd quota \(0\.0 GB left of 0\)")
+
     def test_snapshots_are_not_evictable(self):
         (self.cache / ".seed-main").mkdir()
         (self.cache / "feat_y").mkdir()

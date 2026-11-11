@@ -3066,12 +3066,25 @@ def snapshot_seeds(project, subs, log):
         if busy:
             continue
         per = disk_media(project)
-        x = per.get(media_of(src, per)) or {}
+        media = media_of(src, per)
+        x = per.get(media) or {}
         size = du(src)
-        old = du(snap) if snap.is_dir() else 0
-        if x.get("quota") and size - old > x["quota"] - x["used"]:
-            log(f"storage {name}: no seed snapshot taken ({size / 2**30:.1f} GB doesn't fit in the quota left)")
-            continue
+        quota_note = lambda room: (f"{size / 2**30:.1f} GB doesn't fit in your {media} quota "
+                                   f"({max(room, 0) / 2**30:.1f} GB left of {x['quota'] / 2**30:.0f})")
+        if x.get("quota"):
+            # the new copy is written whole before the old one goes: room for
+            # all of it; else the old one first, else unused subs evicted
+            room = x["quota"] - x["used"]
+            old = du(snap) if snap.is_dir() else 0
+            if room < size <= room + old:
+                shutil.rmtree(snap, ignore_errors=True)
+                room += old
+                log(f"storage {name}: the old seed snapshot goes first, to make room for the new one")
+            if size > room:
+                room = seed_room(project, base, sub, src, size, log)[0] or 0
+            if size > room:
+                log(f"storage {name}: no seed snapshot taken: {quota_note(room)}")
+                continue
         new, gone = snap.with_name(snap.name + ".new"), snap.with_name(snap.name + ".old")
         for d in (new, gone):
             shutil.rmtree(d, ignore_errors=True)
@@ -3080,7 +3093,11 @@ def snapshot_seeds(project, subs, log):
                            env={**os.environ, "LC_ALL": "C"})
         if r.returncode != 0:
             shutil.rmtree(new, ignore_errors=True)
-            log(f"storage {name}: no seed snapshot taken ({r.stderr.strip()[:200] or 'the copy failed'})")
+            err = r.stderr.strip()
+            if x.get("quota") and re.search(r"No space left|quota exceeded", err, re.I):
+                after = disk_media(project).get(media) or x
+                err = quota_note(after.get("quota", 0) - after.get("used", 0))
+            log(f"storage {name}: no seed snapshot taken: {err[:200] or 'the copy failed'}")
             continue
         if snap.exists():
             snap.rename(gone)

@@ -12,6 +12,7 @@
     options = [], format = null, confirm = null, overridden = false, resetLabel = "reset",
     bare = false,   // inside a table cell: no line nor padding of its own
     bigStep = null,
+    typed = true,   // a range's value is a number field (false: a label, for a range over choices)
     onset, onreset = null,
   } = $props();
   let draft = $state(null);
@@ -91,6 +92,21 @@
     undo = null;
     apply(p).then(() => (undo = null));
   }
+  // a typed value: clamped to the range and its step, a draft like a drag
+  let clamped = $state("");
+  function typedValue(e) {
+    const raw = Number(e.currentTarget.value);
+    if (e.currentTarget.value.trim() === "" || Number.isNaN(raw)) {
+      e.currentTarget.value = String(shown);
+      return;
+    }
+    if (raw === Number(draft ?? value)) return;   // Enter, then the change event: already taken
+    const v = Math.min(max, Math.max(min, min + Math.round((raw - min) / step) * step));
+    clamped = v !== raw ? (raw > max ? `max ${max}` : raw < min ? `min ${min}` : `steps of ${step}`) : "";
+    e.currentTarget.value = String(v);
+    draft = v === value ? null : v;
+  }
+  const note = $derived(format && kind === "range" && String(format(shown)) !== `${shown}${unit}` ? format(shown) : "");
   function toggle(o) {
     const cur = [...(shown || [])];
     draft = cur.includes(o) ? cur.filter((x) => x !== o) : [...cur, o];
@@ -104,8 +120,19 @@
       <input type="range" bind:this={rangeEl} {min} {max} {step} value={shown} aria-label={label}
              title="hold Ctrl for steps of {big}{unit}"
              onpointerdown={(e) => (ctrl = e.ctrlKey)} onpointermove={(e) => (ctrl = e.ctrlKey)} onkeydown={bigKey}
-             oninput={(e) => { const v = Number(e.currentTarget.value); draft = ctrl ? snap(v) : v; if (ctrl) e.currentTarget.value = String(draft); }} />
-      <span class="mono val" style:min-width="{widest + 1}ch">{show(shown)}</span>
+             oninput={(e) => { clamped = ""; const v = Number(e.currentTarget.value); draft = ctrl ? snap(v) : v; if (ctrl) e.currentTarget.value = String(draft); }} />
+      {#if typed}
+        <span class="typed">
+          <input type="number" class="mono num" {min} {max} {step} value={shown} aria-label="{label} value"
+                 style:width="{String(max).length + 4.5}ch"
+                 onchange={typedValue}
+                 onkeydown={(e) => { if (e.key === "Enter") typedValue(e); if (e.key === "Escape") { draft = null; clamped = ""; e.currentTarget.value = String(value); } }} />
+          {#if unit.trim()}<span class="mute">{unit.trim()}</span>{/if}
+          {#if clamped}<span class="warn small">{clamped}</span>{:else if note}<span class="mute small">{note}</span>{/if}
+        </span>
+      {:else}
+        <span class="mono val" style:min-width="{widest + 1}ch">{show(shown)}</span>
+      {/if}
     {:else if kind === "select"}
       <select value={shown} aria-label={label} onchange={(e) => (draft = e.currentTarget.value)}>
         {#each options as o}<option value={o}>{o}</option>{/each}
@@ -136,6 +163,8 @@
   .ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   input[type=range] { width: 200px; padding: 0; border: 0; background: none; }
   .val { white-space: nowrap; }
+  .typed { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .num { padding: 2px 4px; text-align: right; }
   .act { display: inline-flex; gap: 6px; min-width: 150px; white-space: nowrap; visibility: hidden; }
   .act.on { visibility: visible; }
   .pin { color: var(--warn); }

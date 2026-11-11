@@ -20,7 +20,7 @@
 <div class="panel">
   <Setting label="CPU power" about="the CPU's long-term power limit (RAPL PL1); a timing job always runs at fast"
            kind="range" value={Math.max(0, PROFILES.indexOf(PW.profile))} min={0} max={2} step={1} bigStep={1}
-           format={(i) => `${PROFILES[i]} · ${PW.profiles[PROFILES[i]]} W`}
+           format={(i) => `${PROFILES[i]} · ${PW.profiles[PROFILES[i]]} W`} typed={false}
            onset={(i) => postNote("/api/admin/power", { profile: PROFILES[i] })} />
   <p class="mute small">{PROFILE_ABOUT[PW.profile] ?? ""} · limit now {PW.limit_w} W{PW.limit_w !== PW.profiles[PW.profile] ? " (a timing job holds the machine)" : ""}</p>
 </div>

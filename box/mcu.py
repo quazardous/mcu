@@ -1989,12 +1989,28 @@ def disk_key(project, job, media):
     return f"{project}/{job}" + ("" if media == "ssd" else f"@{media}")
 
 
+# a job's disk need is the largest growth of its last runs: a past spike
+# stops counting after these many runs, or this long (a job refused for a
+# need it no longer has records no run to bring it down)
+DISK_RUNS = 5
+DISK_RUN_DAYS = 7
+
+
+def disk_runs(value, now=None):
+    """the growths kept for a job, [bytes, time] each, the expired ones out
+    (disk.json held a single number before: one run, kept until five newer)"""
+    runs = value if isinstance(value, list) else [value] if value else []
+    runs = [r if isinstance(r, list) else [r, None] for r in runs]
+    now = time.time() if now is None else now
+    return [r for r in runs if r[1] is None or now - r[1] < DISK_RUN_DAYS * 86400]
+
+
 def learned_disk(project, job, media="ssd"):
-    """the most a run of this job has grown the project's disk on a pool
+    """the most one of this job's last runs grew what it writes on a pool
     type (disk.json, kept by the runners like memory.json)"""
     path = STATE / "disk.json"
     data = json.loads(path.read_text()) if path.exists() and path.stat().st_size else {}
-    return data.get(disk_key(project, job, media), 0)
+    return max((b for b, _ in disk_runs(data.get(disk_key(project, job, media)))), default=0)
 
 
 def _disk_json(change):
@@ -2014,12 +2030,17 @@ def _disk_json(change):
 def record_disk(project, job, growth, log, media="ssd"):
     key = disk_key(project, job, media)
 
+    said = {}
+
     def change(data):
-        if growth <= data.get(key, 0):
-            return False
-        data[key] = growth
+        runs = disk_runs(data.get(key))
+        said["before"] = max((b for b, _ in runs), default=0)
+        runs = (runs + [[max(int(growth), 0), int(time.time())]])[-DISK_RUNS:]
+        data[key] = runs
+        said["after"] = max(b for b, _ in runs)
         return True
-    if _disk_json(change):
+    if _disk_json(change) and said["after"] != said["before"]:
+        growth = said["after"]
         log(f"disk need learned{'' if media == 'ssd' else ' on ' + media}: {growth / 2**30:.2f} GB")
 
 
@@ -2029,27 +2050,45 @@ def forget_disk(project, jobs):
     return _disk_json(lambda data: bool([data.pop(k) for k in list(data) if k in keys]))
 
 
-class DiskWatch:
-    """the project's disk use per pool type while a job runs, every 15 s:
-    its peak minus its use at the start is what this job needs there,
-    learned for its pre-flight"""
+def disk_blocks(path):
+    """what a tree takes on disk, as a quota counts it (through the link
+    of a unit placed on another pool)"""
+    r = subprocess.run(["du", "-s", "--block-size=1", str(Path(path).resolve())], capture_output=True, text=True)
+    try:
+        return int(r.stdout.split()[0])
+    except (IndexError, ValueError):
+        return 0
 
-    def __init__(self, project):
+
+class DiskWatch:
+    """what a job writes, per pool type, while it runs: the storage subs it
+    mounts, its /work and its outputs, every minute. Its peak minus the
+    start is what this job needs there, learned for its pre-flight. Only
+    the job's own trees: the project's other jobs running meanwhile (their
+    builds, their seed copies) are not this job's need"""
+
+    def __init__(self, project, paths):
         import threading
         self.project = project
-        self.start = {m: x["used"] for m, x in disk_media(project).items()}
+        per = disk_media(project)
+        self.paths = {}
+        for p in paths:
+            self.paths.setdefault(media_of(p, per) if per else "ssd", []).append(p)
+        self.start = self.use()
         self.peak = dict(self.start)
         self.done = threading.Event()
         self.thread = threading.Thread(target=self.sample, daemon=True)
         self.thread.start()
 
+    def use(self):
+        return {m: sum(disk_blocks(p) for p in ps) for m, ps in self.paths.items()}
+
     def take(self):
-        for m, x in disk_media(self.project).items():
-            if m in self.peak:
-                self.peak[m] = max(self.peak[m], x["used"])
+        for m, used in self.use().items():
+            self.peak[m] = max(self.peak.get(m, 0), used)
 
     def sample(self):
-        while not self.done.wait(15):
+        while not self.done.wait(60):
             self.take()
 
     def stop(self, job, log):
@@ -2125,9 +2164,9 @@ def preflight_disk(project, job, own_subs, log, job_id):
     this job is known to need there? If not, drop the images nothing needs,
     then evict tmp storage on that pool type; if that is not enough, exit 75
     with the figures rather than fail midway"""
-    # what a seed copied for this run is the bulk of that growth, done
-    # already (and counted in the quota): it comes off the need
-    needs = {m: max(int(learned_disk(project, job, m) * 1.1) - SEEDED.get(m, 0), 0) for m in MEDIA}
+    # a seed copied for this run is done already and counted in the quota;
+    # the learned need is what the job writes after it
+    needs = {m: int(learned_disk(project, job, m) * 1.1) for m in MEDIA}
     if not any(needs.values()):
         return
     per = disk_media(project)
@@ -3043,7 +3082,6 @@ def empty_storage_dir(path):
         shutil.rmtree(x, ignore_errors=True) if x.is_dir() and not x.is_symlink() else x.unlink(missing_ok=True)
 
 
-SEEDED = {}   # pool type -> bytes this run's seeds copied: already part of its learned need
 
 
 SNAP = ".seed-"   # <storage>/.seed-<sub>: a seed's snapshot, taken when a job that wrote it ends
@@ -3174,7 +3212,6 @@ def seed_sub(base, sub, seed, log):
         shutil.rmtree(home / base / sub, ignore_errors=True)
         (home / base / sub).mkdir(parents=True, exist_ok=True)
         return
-    SEEDED[media] = SEEDED.get(media, 0) + size
     origin = f"{seed}'s snapshot" if src.name.startswith(SNAP) else seed
     log(f"storage {base}/{sub}: seeded from {origin} in {time.time() - t0:.1f} s (a reflink copy where the disk allows)")
 
@@ -3635,7 +3672,8 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
           exclusive=rights["exclusive"], memory=rights["memory_need"],
           memory_limit=parse_size(rights["memory"]))
     preflight_disk(project, req["name"], entry["subs"], log, d.name)
-    disk = DiskWatch(project)
+    disk = DiskWatch(project, [work, out] + [Path.home() / "cache" / n for k, n, _ in all_mounts(rights)
+                                            if k == "cache"])
     log(f"memory: {rights['memory_need'] / 2**30:.1f} GB reserved, the container's limit "
         f"{parse_size(rights['memory']) / 2**30:.1f} GB"
         + (f"; its services {rights['services_memory'] / 2**30:.1f} GB more" if rights["services"] else ""))

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -193,6 +194,29 @@ class Parsers(unittest.TestCase):
     def test_cpus(self):
         self.assertEqual(mcu.parse_cpus("0,6"), {0, 6})
         self.assertEqual(mcu.parse_cpus("0-2,8"), {0, 1, 2, 8})
+
+    def test_disk_need_window(self):
+        saved = mcu.STATE
+        with tempfile.TemporaryDirectory() as tmp:
+            mcu.STATE = Path(tmp)
+            try:
+                said = []
+                # a number from before the window counts as one run
+                (mcu.STATE / "disk.json").write_text(json.dumps({"p/j@hdd": 70 * 2**30}))
+                self.assertEqual(mcu.learned_disk("p", "j", "hdd"), 70 * 2**30)
+                for _ in range(mcu.DISK_RUNS):
+                    mcu.record_disk("p", "j", 2 * 2**30, said.append, "hdd")
+                # the old spike has left the last runs
+                self.assertEqual(mcu.learned_disk("p", "j", "hdd"), 2 * 2**30)
+                self.assertEqual(len(said), 1)   # said once, when the need changed
+                mcu.record_disk("p", "j", 5 * 2**30, said.append, "hdd")
+                self.assertEqual(mcu.learned_disk("p", "j", "hdd"), 5 * 2**30)
+                # a run older than the window no longer counts
+                old = time.time() - (mcu.DISK_RUN_DAYS + 1) * 86400
+                (mcu.STATE / "disk.json").write_text(json.dumps({"p/j@hdd": [[70 * 2**30, old], [2 * 2**30, None]]}))
+                self.assertEqual(mcu.learned_disk("p", "j", "hdd"), 2 * 2**30)
+            finally:
+                mcu.STATE = saved
 
     def test_params(self):
         crates = "+".join(f"some-crate-{i}" for i in range(40))   # a long list fits

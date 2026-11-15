@@ -493,6 +493,30 @@ run containers (still confined), with `/proc` unmasked. It stays rootless, in
 your project's user. Its command runs as the container's PID 1, without an
 init (podman's is not allowed under that type). Leave it off for every other job.
 
+**A sandbox run as root makes no user namespace of its own.** The job's
+command runs as root in its container, without `CAP_SYS_ADMIN`. bwrap sees
+uid 0, takes itself for privileged, and does not create a user namespace. So
+`--unshare-pid` (or ipc, net, uts, cgroup) fails with `Creating new namespace
+failed: Operation not permitted`, unless `--unshare-user` (or
+`--unshare-all`) comes with it. Flatpak (`flatpak-builder`, `flatpak run`)
+passes such flags. Run it as a non-root user of the image instead, and bwrap
+makes its own user namespace and every namespace it needs:
+
+```toml
+[image]
+run = ["dnf -y install flatpak flatpak-builder && dnf clean all",
+       "useradd -m builder"]
+
+[jobs.flatpak]
+sandbox = true
+command = "chown -R builder /out && HOME=/home/builder setpriv --reuid=builder --regid=builder --init-groups -- flatpak-builder ..."
+```
+
+One flag stays refused whoever runs it: `--disable-userns` (Flatpak 1.16
+passes it) writes `/proc/sys/user/max_user_namespaces`, which the sandbox's
+SELinux type does not allow. A bwrap wrapper that drops this flag
+(`FLATPAK_BWRAP`) is the way around it.
+
 ### Services: a database or a web server beside a job
 <!-- topic: services -->
 

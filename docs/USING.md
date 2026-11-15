@@ -821,13 +821,17 @@ first = [{ job = "check", pass = ["branch", "crate"] }]
 - `run test-crate branch=x crate=y` submits `check branch=x crate=y`, then
   `test-crate` waiting on it with `after_ok` (holding nothing meanwhile). If
   the identical check (same job, same passed parameters) is already queued or
-  running, `test-crate` waits on that one instead of submitting another.
+  running, `test-crate` waits on that one instead of submitting another; jobs
+  submitted together share one.
 - `pass` lists the run's parameters given to the prerequisite; the others
   take its defaults. It uses the same Benchfile as the job.
-- **Once per commit:** a prerequisite that finds, after its fetch, an
-  earlier successful run with the same parameters, Benchfile and commits
-  (and the same pushed code) ends at once with exit 0 ("already passed at …
-  by <id>: not run again").
+- **Once per commit:** a prerequisite that finds an earlier successful run
+  with the same parameters, Benchfile and commits (and the same pushed code)
+  ends at once with exit 0 ("already passed at … by <id>: not run again").
+  It looks before it queues, from its checkouts' commits, holding no threads
+  and no storage. When that earlier run also recorded a repository its
+  checkouts don't explain (one your `[fetch]` brought), it queues and looks
+  again after its fetch.
 - If it fails, the job does not run and ends with **exit 79**; its log says
   `first: check <id> failed (exit 101)`. `status` shows each prerequisite and
   its state.

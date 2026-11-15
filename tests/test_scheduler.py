@@ -542,6 +542,38 @@ class First(unittest.TestCase):
         self.assertIsNone(find({"app": "abc"}, pushed="1234"))    # other pushed code
         self.assertIsNone(find({}))                          # no checkout: nothing to compare
 
+    def test_passed_before_the_queue(self):
+        """before it queues, a prerequisite knows only its checkouts' heads:
+        an earlier run matches when its other commits are under them"""
+        done = lambda i, commits: {"kind": "done", "id": i, "project": "myapp", "job": "check", "status": 0,
+                                   "params": {"branch": "x"}, "commits": commits, "benchfile": 3}
+        find = lambda heads: mcu.passed_before("myapp", "check", {"branch": "x"}, heads, (None, 3), "",
+                                               heads_only=True)
+        mcu.recent_events = lambda: [done("a", {"app": "abc", "app/sub": "123"})]
+        self.assertEqual(find({"app": "abc"}), "a")          # a submodule, fixed by app's commit
+        self.assertIsNone(find({"app": "def"}))
+        self.assertIsNone(find({"app": "abc", "lib": "456"}))  # a checkout it did not have
+        mcu.recent_events = lambda: [done("b", {"app": "abc", "tool": "789"})]
+        self.assertIsNone(find({"app": "abc"}))               # a source its fetch brought: after the fetch
+        self.assertIsNone(mcu.passed_before("myapp", "check", {"branch": "x"}, {"app": "abc"}, (None, 3), ""))
+
+    def test_concurrent_submits_share_one_prerequisite(self):
+        import threading
+        import time as t
+        create = mcu.create_job
+
+        def slow(*a, **kw):
+            t.sleep(0.05)       # the window between the lookup and the request
+            return create(*a, **kw)
+        mcu.create_job = slow
+        runs = [threading.Thread(target=mcu.submit_first, args=("test", {"branch": "x"}, {"after_ok": []}, None))
+                for _ in range(3)]
+        for r in runs:
+            r.start()
+        for r in runs:
+            r.join()
+        self.assertEqual(len(self.created), 1)
+
     def test_a_failed_first_names_it(self):
         pre = self.jobs / "20261108-090000-aaaa"
         pre.mkdir()

@@ -3389,15 +3389,39 @@ def git_cache(url, log, want=None):
     return bare, lock
 
 
+def ref_commit(bare, ref):
+    """the commit a ref names in a cached repository (fetched when the ref is
+    not a branch or tag the cache has, a commit off every branch say)"""
+    sha = git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=bare, check=False)
+    if not sha:
+        git("fetch", "--quiet", "origin", ref, cwd=bare)
+        sha = git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=bare)
+    return sha
+
+
+def checkout_heads(plan, log):
+    """the commits the job's checkouts would take, from the project's git
+    cache (fetched), before the job holds threads or storage; None when one
+    cannot be resolved (the checkouts proper will say why)"""
+    heads = {}
+    for name, spec in plan["checkouts"].items():
+        try:
+            bare, lock = git_cache(spec["repo"], log)
+            try:
+                heads[name] = ref_commit(bare, spec["ref"])
+            finally:
+                lock.close()
+        except GitFailed:
+            return None
+    return heads
+
+
 def checkout_v5(name, spec, work, log):
     """/work/<name>: its own clone of the cached repository at the ref, with
     its submodules from the cache too; returns the commit"""
     bare, lock = git_cache(spec["repo"], log)
     try:
-        sha = git("rev-parse", "--verify", "--quiet", f"{spec['ref']}^{{commit}}", cwd=bare, check=False)
-        if not sha:
-            git("fetch", "--quiet", "origin", spec["ref"], cwd=bare)
-            sha = git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=bare)
+        sha = ref_commit(bare, spec["ref"])
         dest = work / name
         # a local clone, not a worktree: a worktree's .git points to the
         # bare repository by a host path the container does not see, and
@@ -3504,19 +3528,38 @@ def pushed_sig():
     return h.hexdigest()[:16] if n else ""
 
 
-def passed_before(project, job, params, commits, benchfile, pushed):
-    """the id of an earlier successful run of this job with the same
+def same_sources(theirs, commits, heads_only):
+    """an earlier run's commits against these. heads_only: these are only
+    the checkouts' heads, resolved before the fetch; the earlier run's other
+    commits must then be under one of those checkouts (submodules, fixed by
+    their parent's commit), else the fetch may have brought another source
+    and only the commits after it can tell"""
+    if not heads_only:
+        return theirs == commits
+    return isinstance(theirs, dict) and all(theirs.get(k) == v for k, v in commits.items()) \
+        and all(k in commits or k.partition("/")[0] in commits and "/" in k for k in theirs)
+
+
+def passed_run(project, job, params, commits, benchfile, pushed, heads_only=False):
+    """the done event of an earlier successful run of this job with the same
     parameters, Benchfile and commits (and the same pushed code), or None"""
     if not commits:
         return None
     label, version = benchfile
     for e in reversed(recent_events()):
         if e.get("kind") == "done" and e.get("project") == project and e.get("job") == job \
-                and e.get("status") == 0 and e.get("params", {}) == params and e.get("commits") == commits \
+                and e.get("status") == 0 and e.get("params", {}) == params \
+                and same_sources(e.get("commits"), commits, heads_only) \
                 and e.get("benchfile") == version and e.get("benchfile_label") == label \
                 and e.get("pushed", "") == pushed:
-            return e.get("reused") or e.get("id")
+            return e
     return None
+
+
+def passed_before(project, job, params, commits, benchfile, pushed, heads_only=False):
+    """the id of that earlier run (the one that really ran), or None"""
+    e = passed_run(project, job, params, commits, benchfile, pushed, heads_only)
+    return (e.get("reused") or e.get("id")) if e else None
 
 
 def push_pushed(work):
@@ -3653,6 +3696,19 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
     work, out = job_work(d, plan["job"], log), d / "out"
     out.mkdir(exist_ok=True)
     push_pushed(work)
+    if req.get("prereq") and plan["checkouts"]:
+        # a prerequisite (first =) that already passed at these commits ends
+        # here, before it queues: no threads, no storage, no checkout
+        heads = checkout_heads(plan, log)
+        e = heads and passed_run(project, req["name"], params, heads, plan["benchfile"], pushed_sig(),
+                                 heads_only=True)
+        if e:
+            prior = e.get("reused") or e.get("id")
+            log(f"already passed at {', '.join(f'{r} {c[:9]}' for r, c in heads.items())} "
+                f"by {prior}: not run again")
+            label, version = plan["benchfile"]
+            finish(0, commits=e["commits"], benchfile=version, **({"benchfile_label": label} if label else {}),
+                   pushed=e.get("pushed", ""), reused=prior)
     entry = {"id": d.name, "pid": os.getpid(), "project": project,
              "job": req["name"], "branch": " ".join(f"{k}={v}" for k, v in params.items()),
              "ext": req.get("ext_job_id"), "priority": req.get("priority"),
@@ -4307,11 +4363,16 @@ def submit_first(name, params, deps, prio):
         return {}
     ids = []
     for pre, pp in first_of(name, params):
-        found = in_flight(pre, pp)
-        if found:
-            print(f"mcu-job: first: {pre} {found}, already queued or running: waiting on it", flush=True)
-        else:
-            found = create_job("job", None, pre, pp, {}, None, prio, extra={"prereq": True}).name
+        # the lookup and the submission under one lock: jobs submitted
+        # together share one prerequisite instead of each seeing none
+        jobs_dir().mkdir(parents=True, exist_ok=True)
+        with open(jobs_dir() / ".first.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            found = in_flight(pre, pp)
+            if found:
+                print(f"mcu-job: first: {pre} {found}, already queued or running: waiting on it", flush=True)
+            else:
+                found = create_job("job", None, pre, pp, {}, None, prio, extra={"prereq": True}).name
         ids.append(found)
         if found not in deps.setdefault("after_ok", []):
             deps["after_ok"].append(found)

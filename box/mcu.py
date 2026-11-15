@@ -838,12 +838,17 @@ def reserved_start(e, live, now, nthreads, pool):
 PRIORITIES = ("high", "normal", "low")
 
 
-def queue_order(queue):
+def queue_order(queue, now=None, max_wait=1800):
     """the order the queue is served in. Within a project, the places its
     jobs hold are dealt again, high then normal then low (each in queue
     order), so another project's jobs never move; then each project's first
-    high job goes ahead of the rest, in queue order between projects"""
-    rank = lambda e: PRIORITIES.index(e.get("priority") or "normal")
+    high job goes ahead of the rest, in queue order between projects. A job
+    that waited past its max_wait is no longer passed by the jobs of its
+    project queued after it, whatever their priority: it ranks as high in
+    the deal, and no later high job of its project is put ahead of it"""
+    now = time.time() if now is None else now
+    starved = lambda e: now - e.get("queued", now) >= (e.get("max_wait") or max_wait)
+    rank = lambda e: 0 if starved(e) else PRIORITIES.index(e.get("priority") or "normal")
     order = list(queue)
     for p in {e.get("project") for e in queue}:
         places = [i for i, e in enumerate(queue) if e.get("project") == p]
@@ -851,7 +856,11 @@ def queue_order(queue):
             order[i] = e
     first, seen = [], set()
     for e in order:
-        if e.get("priority") == "high" and e.get("project") not in seen:
+        if e.get("project") in seen:
+            continue
+        if starved(e):
+            seen.add(e.get("project"))      # its project's high jobs stay behind it
+        elif e.get("priority") == "high":
             seen.add(e.get("project"))
             first.append(e)
     return first + [e for e in order if not any(e is f for f in first)]
@@ -928,7 +937,7 @@ def queue_view(sched, events, project=None):
         if typ is None:
             s["end"] = INF  # for the times: unknown, not its timeout
         slots.append(s)
-    waiting, starts, t = queue_order(sched.get("queue", [])), {}, now
+    waiting, starts, t = queue_order(sched.get("queue", []), now, max_wait), {}, now
     if not (hold() or maintenance()):
         while waiting and t < INF:
             live = [s for s in slots if s["end"] > t]
@@ -941,7 +950,7 @@ def queue_view(sched, events, project=None):
                     break
             else:
                 t = min((s["end"] for s in slots if s["end"] > t), default=INF)
-    queue = queue_order(sched.get("queue", []))
+    queue = queue_order(sched.get("queue", []), now, max_wait)
     # a job waiting for its dependencies: no earlier than their expected
     # ends (then the queue, not counted here)
     entries = {e["id"]: e for e in queue + sched.get("deps", [])}
@@ -1019,7 +1028,8 @@ def queue_state(project, sched, events):
                 "exclusive": q.get("exclusive", []), "queued": q.get("queued"), "waiting": q.get("waiting"),
                 "priority": q.get("priority") or "normal",
                 "about": about(q), **mine(q), **view["waiting"][q["id"]]}
-               for q in queue_order(sched.get("queue", []))]
+               for q in queue_order(sched.get("queue", []), max_wait=parse_duration(
+                   box_conf().get("backfill_max_wait", "30m")))]
     blocked = [{"project": e["project"], "job": e["job"], "since": e.get("since"), "about": about(e), **mine(e),
                 **({"after": e.get("after", []), "after_ok": e.get("after_ok", []), "waiting_for": e.get("waiting_for")}
                    if project and e.get("project") == project else {}),
@@ -1427,7 +1437,7 @@ class Scheduler:
                     return None, f"{m['project']}'s {m['unit']} is being moved to {m['pool']}"
             now = time.time()
             live = [run_slot(r, now, est) for r in running]
-            order = queue_order(queue)
+            order = queue_order(queue, now, max_wait)
             why = may_start(me, order[:order.index(me)], live, now, est, len(threads), pool, max_wait)
             used = {c for r in running for c in r["threads"]}
             free = [c for c in threads if c not in used]

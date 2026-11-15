@@ -1025,8 +1025,11 @@ places they already hold in the queue: high ones first, then normal, then
 low, each in queue order. So the other projects' jobs never move because of
 them. Across projects, only a project's first high-priority job goes ahead
 of the rest (in queue order between projects); its other high jobs keep the
-project's places. The rules above still apply (backfill, `max_wait`,
-machine jobs, dependencies).
+project's places. A job that has waited past its `max_wait` is no longer
+passed by its project's jobs queued after it, whatever their priority: a
+stream of high jobs cannot starve a normal one. Keep `high` for what is
+urgent; when most jobs carry it, it orders nothing. The rules above still
+apply (backfill, machine jobs, dependencies).
 
 ```sh
 queue            # the capacity, what runs (since, expected end), what waits

@@ -172,6 +172,21 @@ class QueueView(unittest.TestCase):
         q = [o("o1"), job("h1", "j"), o("o2")]
         self.assertEqual(ids(q), ["o1", "h1", "o2"])
 
+    def test_a_starved_job_is_not_passed_by_its_projects_high_jobs(self):
+        ids = lambda q: [e["id"] for e in mcu.queue_order(q, max_wait=1800)]
+        o = lambda i, **kw: job(i, "j", project="other", **kw)
+        old = time.time() - 2 * 3600
+        # n waited 2 h: the high jobs queued after it stay behind it, other's jobs keep their places
+        q = [o("o1"), job("n", "j", queued=old), job("h1", "j", priority="high"), o("o2"),
+             job("h2", "j", priority="high")]
+        self.assertEqual(ids(q), ["o1", "n", "h1", "o2", "h2"])
+        # not yet past its max wait: the high jobs go first, as before
+        q = [o("o1"), job("n", "j"), job("h1", "j", priority="high"), o("o2")]
+        self.assertEqual(ids(q), ["h1", "o1", "n", "o2"])
+        # its own max_wait counts before the box's
+        q = [job("n", "j", queued=time.time() - 600, max_wait=300), job("h1", "j", priority="high")]
+        self.assertEqual(ids(q), ["n", "h1"])
+
     def test_held_queue(self):
         mcu.hold = lambda: "admin"
         v = mcu.queue_view({"running": [], "queue": [job("a", "gpu")]}, HISTORY)

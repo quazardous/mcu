@@ -4596,6 +4596,13 @@ def entry():
     except Refused as e:
         print(f"mcu-job: refused: {e}", file=sys.stderr)
         return 2
+    except BrokenPipeError:
+        # the client stopped reading (ssh closed, `| head`): the job is
+        # untouched, only this follower ends. stdout points at /dev/null so
+        # the interpreter's last flush stays quiet (no traceback, no abrt)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 128 + int(signal.SIGPIPE)
 
 
 def envelope_summary():

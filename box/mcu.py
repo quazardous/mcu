@@ -4381,6 +4381,15 @@ def entry():
     words = os.environ.get("SSH_ORIGINAL_COMMAND", "help").split()
     cmd, args = (words[0], words[1:]) if words else ("help", [])
     try:
+        if "SSH_ORIGINAL_COMMAND" not in os.environ:
+            # typed on the box (ssh <box> mcu-job status <id>): mcu-job only
+            # reads the command ssh forces for a project's key
+            user = os.environ.get("USER", "")
+            ours = any(user.startswith(p) and user != f"{p}web" for p in ("mcu-", "bench-"))
+            if sys.argv[2:] or not ours:
+                verb = " ".join(sys.argv[2:]) or "<verb>"
+                raise Misconfigured(f"mcu-job takes its command over ssh, as your project's account: "
+                                    f"ssh mcu-<project>@{socket.gethostname()} {verb}")
         if cmd == "box" and not args:
             return box_status()
         if cmd == "docs" and len(args) <= 1:

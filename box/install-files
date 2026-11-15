@@ -17,7 +17,7 @@ done
 [ -f "$top/dashboard/dist/index.html" ] || { echo "install-files: build the dashboard first (dashboard/: npm ci && npm run build)" >&2; exit 2; }
 rm -rf "$lib/ui.new" && cp -r "$top/dashboard/dist" "$lib/ui.new" && chmod -R a+rX "$lib/ui.new"
 rm -rf "$lib/ui" && mv "$lib/ui.new" "$lib/ui"
-printf '#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/mcu/mcu.py entry\n' > "$bin/mcu-job"
+printf '#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/mcu/mcu.py entry "$@"\n' > "$bin/mcu-job"
 chmod 755 "$bin/mcu-job"
 # the admin's command, in root's PATH
 ln -sfn /usr/local/lib/mcu/mcu-admin "$sbin/mcu-admin"

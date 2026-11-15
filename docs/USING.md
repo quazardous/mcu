@@ -1114,7 +1114,9 @@ one of the box's:
 - **A job that needs the network fails at its checkout:** the envelope's
   `network` decides what jobs may reach. `[checkout]` and `[fetch]` run with
   network; the job itself runs with what it asked for, within the envelope
-  (`docs config`).
+  (`docs config`). A network failure at a checkout (DNS, a reset
+  connection) is tried three more times, after 5, 20 and 60 s, each said in
+  the log; only then does the job fail.
 - **"waiting: storage x/y in use":** another of your jobs holds that locked
   storage. Different subs run side by side (`docs storage`).
 - **A job waits for a long time:** `queue` says why each job waits and when it

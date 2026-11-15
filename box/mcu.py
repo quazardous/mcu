@@ -3287,9 +3287,13 @@ class GitFailed(Exception):
     pass
 
 
-# git's messages (in the C locale) for a network failure, worth one retry
+# git's messages (in the C locale) for a network failure, worth retrying
 NET_ERROR_RE = re.compile(r"Failed to connect|Could not resolve|Couldn't connect|Connection (refused|reset|timed out)"
                           r"|Operation timed out|timed out|early EOF|RPC failed|SSL_|TLS", re.I)
+
+
+# the waits before each new try of a checkout that met a network failure
+CHECKOUT_RETRIES = (5, 20, 60)
 
 
 # git's automatic maintenance after a fetch runs in the foreground: detached,
@@ -3393,17 +3397,18 @@ def stage_v5(plan, threads, work, out, logf, log):
     container with network; returns the commits found"""
     commits = {}
     for name, spec in plan["checkouts"].items():
-        for attempt in (1, 2):
+        for wait in (*CHECKOUT_RETRIES, None):
             try:
                 commits[name] = checkout_v5(name, spec, work, log)
                 break
             except GitFailed as e:
-                # a network glitch gets one more try; a missing ref or
-                # anything else fails at once
-                if attempt == 1 and NET_ERROR_RE.search(str(e)):
-                    log(f"checkout {name}: the network failed ({e}); trying again in 5 s")
+                # a network glitch (a DNS blip lasts longer than a few
+                # seconds) gets three more tries; a missing ref or anything
+                # else fails at once
+                if wait is not None and NET_ERROR_RE.search(str(e)):
+                    log(f"checkout {name}: the network failed ({e}); trying again in {wait} s")
                     shutil.rmtree(work / name, ignore_errors=True)
-                    time.sleep(5)
+                    time.sleep(wait)
                     continue
                 log(f"checkout {name} failed: {e}")
                 raise FetchFailed() from e

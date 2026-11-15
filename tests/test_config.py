@@ -194,6 +194,18 @@ class Parsers(unittest.TestCase):
         self.assertEqual(mcu.parse_cpus("0,6"), {0, 6})
         self.assertEqual(mcu.parse_cpus("0-2,8"), {0, 1, 2, 8})
 
+    def test_params(self):
+        crates = "+".join(f"some-crate-{i}" for i in range(40))   # a long list fits
+        self.assertEqual(mcu.parse_params([f"crates={crates}", "lib=x"]), {"crates": crates, "lib": "x"})
+        cases = {"crates=" + "a" * 4001: "4001 characters, at most 4000",
+                 "crates=a,b": "character ',' not allowed",
+                 "crates=": "empty value",
+                 "Crates=a": "key=value"}
+        for word, said in cases.items():
+            with self.assertRaises(mcu.Refused) as e:
+                mcu.parse_params([word])
+            self.assertIn(said, str(e.exception))
+
 
 class TrackerRefs(unittest.TestCase):
     def test_pattern(self):

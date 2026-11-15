@@ -274,7 +274,8 @@ boxes. A box refuses a format newer than it reads, and says which version of
 mcu it runs.
 
 Run it with parameters, which fill the `${...}` (values limited to
-`[A-Za-z0-9._/@+-]`):
+`[A-Za-z0-9._/@+-]`, at most 4000 characters, enough for a list joined
+with `+`):
 
 ```sh
 run test branch=my-feature lib=fix-x

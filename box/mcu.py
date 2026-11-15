@@ -73,7 +73,10 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}\Z")
 # a run parameter (run <job> key=value): substituted into the Benchfile's
 # commands, so only characters that need no quoting in a shell
 PARAM_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]{0,30}\Z")
-PARAM_VALUE_RE = re.compile(r"^[A-Za-z0-9._/@+-]{1,200}\Z")
+# a value reaches the job only through ${name}, in this character set; its
+# length is limited so a list (crates, test names) fits
+PARAM_VALUE_MAX = 4000
+PARAM_VALUE_RE = re.compile(r"^[A-Za-z0-9._/@+-]+\Z")
 FILE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\Z")
 
 # state.json and events.jsonl are shared by every project user through the
@@ -5597,8 +5600,16 @@ def parse_params(words):
     params = {}
     for w in words:
         key, sep, value = w.partition("=")
-        if not sep or not PARAM_KEY_RE.match(key) or not PARAM_VALUE_RE.match(value):
-            raise Refused(f"bad parameter {w!r}: key=value, value in [A-Za-z0-9._/@+-]")
+        if not sep or not PARAM_KEY_RE.match(key):
+            raise Refused(f"bad parameter {w[:60]!r}: key=value, key in [a-z0-9_] (31 at most)")
+        if not value:
+            raise Refused(f"parameter {key}: empty value")
+        if len(value) > PARAM_VALUE_MAX:
+            raise Refused(f"parameter {key}: {len(value)} characters, at most {PARAM_VALUE_MAX}")
+        if not PARAM_VALUE_RE.match(value):
+            bad = sorted({c for c in value if not re.match(r"[A-Za-z0-9._/@+-]", c)})
+            raise Refused(f"parameter {key}: character{'s' if len(bad) > 1 else ''} {' '.join(map(repr, bad))}"
+                          f" not allowed (A-Za-z0-9._/@+-)")
         params[key] = value
     return params
 

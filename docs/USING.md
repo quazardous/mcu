@@ -661,7 +661,9 @@ scratch = { about = "per run", drop = true }
   still mounts it).
 - `until = "branch"`: kept while the branch the parameter `branch` names
   exists on the remote (the repositories your `[checkout]`s point at). The
-  box's daily housekeeping removes it once the branch is deleted. Name the
+  box's daily housekeeping removes it once the branch is deleted; so does a
+  job short of room, and, when your use passes 90 % of a quota, the box
+  within minutes (at most once an hour). Name the
   parameter the sub is keyed on: `until = "lib"` for
   `"lib-target/${lib:-main}"`, checked against the checkout whose
   `ref` uses `${lib}`. When the rule names another parameter and the
@@ -692,11 +694,17 @@ storage prune [--older-than 7d] [--keep <sub>]... [--dry-run]
                                  # drop your tmp subs unused for that long, in one call
 ```
 
-**Room before a job.** The box learns how much each job grows your disk,
-on the SSD and on the spinning disk separately (its peak during the run on
-each). Before the next run starts, it checks each pool type against your
-quota there. If one has less room than the job's need there, plus 10 %:
+**Room before a job.** The box learns how much each job writes (its
+`/work`, its outputs, the storage it mounts), on the SSD and on the
+spinning disk separately. Before the next run starts, it checks each pool
+type against your quota there. It wants the job's learned need plus 10 %,
+and on the pool types the job writes to, **5 % of the quota kept free**
+besides, for what the job was never seen to write (the first build of a new
+branch). If one has less room:
 - it drops the images nothing needs now (see `config clean images`);
+- it removes your storage whose branch is deleted on the remote (`until =`),
+  and logs each one ("removed storage target/feat_x, 17.2 GB: branch feat/x
+  is gone");
 - it evicts your **least recently used tmp subs** on that pool type, never a sub a
   queued or running job of yours mounts, nor a `tmp = false` storage, and
   logs each one ("evicted storage lib-target/feat-x, 4.1 GB, unused

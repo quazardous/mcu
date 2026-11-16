@@ -2169,18 +2169,74 @@ def evict(project, need, protect, log, job_id=None, media="ssd"):
     return room
 
 
-def preflight_disk(project, job, own_subs, log, job_id):
+DISK_FLOOR = 0.05   # of a quota, kept free beyond a job's learned need where it writes
+
+
+def storage_with_ends(project, protect=()):
+    """each storage (or sub) of the project that states its end, as
+    (cache dir, path, name, life info); never one in protect"""
+    cache = Path(f"/home/mcu-{project}/cache")
+    out = []
+    for c in sorted(cache.iterdir()) if cache.exists() else []:
+        if c.name == ".git" or not c.is_dir():
+            continue
+        targets = [x for x in c.iterdir() if x.is_dir()] if (c / ".bench-per").exists() else [c]
+        for t in targets:
+            if t.name.startswith(SNAP):
+                continue
+            info = life_info(t)
+            name = c.name + (f"/{t.name}" if t != c else "")
+            if info.get("life") and name not in protect:
+                out.append((c, t, name, info))
+    return out
+
+
+def drop_storage(project, c, t, name, why, job_id=None):
+    """a storage (or sub) whose end came: gone, with its record; a whole
+    storage is emptied, not removed. Returns the bytes freed"""
+    size = du(t)
+    if t != c:
+        shutil.rmtree(t, ignore_errors=True)
+        life_file(t).unlink(missing_ok=True)   # its record goes with it
+    else:
+        empty_storage_dir(t)
+    event(kind="storage", project=project, storage=name, removed=why, bytes=size,
+          **({"id": job_id} if job_id else {}))
+    return size
+
+
+def drop_gone(project, protect, log, job_id=None):
+    """the project's storage keyed on a branch (until =) whose branch is
+    deleted on the remote, removed now; returns the bytes freed"""
+    freed, seen = 0, {}
+    for c, t, name, info in storage_with_ends(project, protect):
+        if info["life"].get("until") and info.get("value") \
+                and branch_gone(info["value"], info.get("repos", []), seen):
+            size = drop_storage(project, c, t, name, f"branch {info['value']} is gone", job_id)
+            log(f"removed storage {name} ({size / 2**30:.2f} GB): branch {info['value']} is gone")
+            freed += size
+    return freed
+
+
+def preflight_disk(project, job, own_subs, log, job_id, where=()):
     """before a job's container: is there room, on each pool type, for what
-    this job is known to need there? If not, drop the images nothing needs,
-    then evict tmp storage on that pool type; if that is not enough, exit 75
-    with the figures rather than fail midway"""
+    this job is known to need there, plus DISK_FLOOR of the quota on the
+    pool types it writes to (where: its /work, its storage), for what it was
+    never seen to write? If not, drop the images nothing needs, then the
+    storage of branches gone on the remote, then evict tmp storage on that
+    pool type; if that is not enough, exit 75 with the figures rather than
+    fail midway"""
     # a seed copied for this run is done already and counted in the quota;
     # the learned need is what the job writes after it
     needs = {m: int(learned_disk(project, job, m) * 1.1) for m in MEDIA}
+    per = disk_media(project)
+    written = {media_of(p, per) for p in where}
+    for m in written:
+        if per.get(m, {}).get("quota"):
+            needs[m] = needs.get(m, 0) + int(per[m]["quota"] * DISK_FLOOR)
     if not any(needs.values()):
         return
-    per = disk_media(project)
-    pruned = False
+    pruned = gone_done = False
     for m in MEDIA:
         need, x = needs[m], per.get(m)
         if need <= 0 or not x or not x.get("quota"):
@@ -2198,6 +2254,16 @@ def preflight_disk(project, job, own_subs, log, job_id):
                 if room >= need:
                     continue
         protect = in_use_subs(project, but=job_id) | set(own_subs)
+        # then the storage of branches deleted on the remote: dead weight
+        # the nightly housekeeping would remove anyway
+        if not gone_done:
+            gone_done = True
+            if drop_gone(project, protect, log, job_id):
+                per = disk_media(project)
+                x = per.get(m, x)
+                room = x["quota"] - x["used"]
+                if room >= need:
+                    continue
         here = [path for _, _, path in tmp_subs(project, protect) if media_of(path, per) == m]
         # nothing goes when even all of it would not make room
         if room + sum(du(path) for path in here) >= need:
@@ -2205,7 +2271,9 @@ def preflight_disk(project, job, own_subs, log, job_id):
                 "evicting tmp storage")
             room = evict(project, need, protect, log, job_id, m)
         if room < need:
-            raise Unavailable(f"needs about {need / 2**30:.1f} GB on {m}, {max(room, 0) / 2**30:.1f} GB left in your "
+            raise Unavailable(f"needs about {need / 2**30:.1f} GB on {m}"
+                              + (f" ({DISK_FLOOR:.0%} of the quota kept free included)" if m in written else "")
+                              + f", {max(room, 0) / 2**30:.1f} GB left in your "
                               f"{x['quota'] / 2**30:.0f} GB {m} quota, and evicting your unused tmp storage there "
                               "cannot make the rest; `storage list` shows what holds it (`storage rm`, or ask the "
                               "admin for more)")
@@ -3737,7 +3805,8 @@ def run_v5(project, conf, req, d, logf, log, finish, sched, t0):
     event(kind="started", id=d.name, project=project, job=req["name"], threads=threads,
           exclusive=rights["exclusive"], memory=rights["memory_need"],
           memory_limit=parse_size(rights["memory"]))
-    preflight_disk(project, req["name"], entry["subs"], log, d.name)
+    preflight_disk(project, req["name"], entry["subs"], log, d.name,
+                   where=[work] + [Path.home() / "cache" / n for k, n, _ in all_mounts(rights) if k == "cache"])
     disk = DiskWatch(project, [work, out] + [Path.home() / "cache" / n for k, n, _ in all_mounts(rights)
                                             if k == "cache"])
     log(f"memory: {rights['memory_need'] / 2**30:.1f} GB reserved, the container's limit "
@@ -5786,37 +5855,62 @@ def storage_housekeeping(project):
     busy = {x for e in sched.get("running", []) + sched.get("queue", []) if e.get("project") == project
             for x in e.get("subs", [])}
     cache, seen = Path(f"/home/mcu-{project}/cache"), {}
+    # a snapshot goes with its seed
     for c in sorted(cache.iterdir()) if cache.exists() else []:
-        if c.name == ".git" or not c.is_dir():
+        if c.name != ".git" and c.is_dir() and (c / ".bench-per").exists():
+            for t in c.iterdir():
+                if t.is_dir() and t.name.startswith(SNAP) and \
+                        not (c / t.name[len(SNAP):].removesuffix(".new").removesuffix(".old")).is_dir():
+                    shutil.rmtree(t, ignore_errors=True)
+    for c, t, name, info in storage_with_ends(project, busy):
+        life = info["life"]
+        why = None
+        if life.get("ttl") and time.time() - info.get("used", time.time()) > life["ttl"]:
+            why = f"unused for {life['ttl'] / 86400:g} days"
+        elif life.get("until") and info.get("value") and branch_gone(info["value"], info.get("repos", []), seen):
+            why = f"branch {info['value']} is gone"
+        if why:
+            drop_storage(project, c, t, name, why)
+        elif life.get("max") and du(t) > life["max"]:
+            freed = trim_to(t, life["max"], lambda m: None)
+            event(kind="storage", project=project, storage=name, trimmed=freed, cap=life["max"])
+
+
+PRESSURE = 0.9          # of a quota: the project's storage housekeeping runs now, not at night
+PRESSURE_EVERY = 3600   # seconds, at most once per project
+
+
+def pressure():
+    """root, after each usage measure: a project past PRESSURE of a quota
+    gets its storage housekeeping now (branches gone, ttl, caps), at most
+    once per PRESSURE_EVERY; the nightly prune does the rest"""
+    with open(STATE / "pressure.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0        # the previous one is still at it
+        return pressure_pass()
+
+
+def pressure_pass():
+    try:
+        usage = json.loads((STATE / "usage.json").read_text())
+    except (OSError, ValueError):
+        return 0
+    stamps = STATE / "pressure"
+    stamps.mkdir(exist_ok=True)
+    for project, u in usage.items():
+        if project.startswith("_") or not isinstance(u, dict):
             continue
-        targets = [x for x in c.iterdir() if x.is_dir()] if (c / ".bench-per").exists() else [c]
-        for t in targets:
-            if t.name.startswith(SNAP):
-                # a snapshot goes with its seed
-                if not (c / t.name[len(SNAP):].removesuffix(".new").removesuffix(".old")).is_dir():
-                    shutil.rmtree(t, ignore_errors=True)
-                continue
-            info = life_info(t)
-            life = info.get("life")
-            name = c.name + (f"/{t.name}" if t != c else "")
-            if not life or name in busy:
-                continue
-            why = None
-            if life.get("ttl") and time.time() - info.get("used", time.time()) > life["ttl"]:
-                why = f"unused for {life['ttl'] / 86400:g} days"
-            elif life.get("until") and info.get("value") and branch_gone(info["value"], info.get("repos", []), seen):
-                why = f"branch {info['value']} is gone"
-            if why:
-                size = du(t)
-                if t != c:
-                    shutil.rmtree(t, ignore_errors=True)
-                    life_file(t).unlink(missing_ok=True)   # its record goes with it
-                else:
-                    empty_storage_dir(t)
-                event(kind="storage", project=project, storage=name, removed=why, bytes=size)
-            elif life.get("max") and du(t) > life["max"]:
-                freed = trim_to(t, life["max"], lambda m: None)
-                event(kind="storage", project=project, storage=name, trimmed=freed, cap=life["max"])
+        full = [m for m, x in (u.get("media") or {}).items()
+                if x.get("quota") and x.get("used", 0) >= PRESSURE * x["quota"]]
+        stamp = stamps / project
+        if not full or (stamp.exists() and time.time() - stamp.stat().st_mtime < PRESSURE_EVERY):
+            continue
+        stamp.touch()
+        event(kind="storage", project=project, pressure=full)
+        storage_housekeeping(project)
+    return 0
 
 
 def prune():
@@ -5876,6 +5970,8 @@ if __name__ == "__main__":
         run_job(sys.argv[2])
     elif mode == "prune":
         sys.exit(prune())
+    elif mode == "pressure":
+        sys.exit(pressure())
     elif mode == "reap":
         # the project user, from the daily prune: pods of ended jobs
         reap_services(lambda m: event(kind="services", project=project_name(), reaped=m))

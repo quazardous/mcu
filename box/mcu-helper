@@ -1568,6 +1568,12 @@ def usage(with_parts=False):
     tmp.write_text(json.dumps(dict(data, _pools=pinfo, _disks=dict(disks(), smart=hw_smart.read_all())), indent=1) + "\n")
     os.chmod(tmp, 0o644)
     os.replace(tmp, STATE / "usage.json")
+    # a project near a quota: its storage housekeeping now, in the
+    # background (it asks the remotes which branches are gone)
+    if with_parts:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve().with_name("mcu.py")), "pressure"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
 
 if __name__ == "__main__":

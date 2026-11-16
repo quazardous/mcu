@@ -904,5 +904,80 @@ class QuotaLines(unittest.TestCase):
                                                                                    "hdd": {"used": 0, "quota": 0}}})), 1)
 
 
+class Room(unittest.TestCase):
+    """room before a job: a floor of the quota on the pool types the job
+    writes to, gone branches before live ones; and the housekeeping a
+    nearly full quota brings forward"""
+
+    GB = 2**30
+
+    def setUp(self):
+        import tempfile
+        names = ("learned_disk", "disk_media", "media_of", "prune_images", "kept_tags", "in_use_subs",
+                 "drop_gone", "tmp_subs", "evict", "du", "STATE", "event", "storage_housekeeping")
+        saved = {k: getattr(mcu, k) for k in names}
+        self.addCleanup(lambda: [setattr(mcu, k, v) for k, v in saved.items()])
+        self.used = 291 * self.GB
+        self.calls = []
+        mcu.learned_disk = lambda project, job, m: 0
+        mcu.disk_media = lambda project: {"ssd": {"used": 0, "quota": 100 * self.GB},
+                                          "hdd": {"used": self.used, "quota": 300 * self.GB}}
+        mcu.media_of = lambda path, per: "hdd"
+        mcu.prune_images = lambda project, keep, log: False
+        mcu.kept_tags = lambda project: set()
+        mcu.in_use_subs = lambda project, but=None: set()
+        mcu.tmp_subs = lambda project, protect: []
+        mcu.du = lambda path: 0
+
+        def drop_gone(project, protect, log, job_id=None):
+            self.calls.append("gone")
+            self.used -= self.freed
+            return self.freed
+        mcu.drop_gone = drop_gone
+        mcu.evict = lambda *a, **kw: self.calls.append("evict") or 0
+        self.freed = 0
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mcu.STATE = Path(tmp.name)
+        mcu.event = lambda **kw: None
+
+    def preflight(self, where=("/work",)):
+        mcu.preflight_disk("p", "test", [], lambda m: None, "id", where=list(where))
+
+    def test_a_job_never_seen_writing_still_wants_the_floor(self):
+        self.freed = 100 * self.GB        # merged branches' targets
+        self.preflight()
+        self.assertEqual(self.calls, ["gone"])     # gone branches first, nothing live evicted
+
+    def test_the_floor_only_where_the_job_writes(self):
+        self.preflight(where=())
+        self.assertEqual(self.calls, [])
+
+    def test_no_room_even_so_is_exit_75_naming_the_floor(self):
+        with self.assertRaises(mcu.Unavailable) as e:
+            self.preflight()
+        self.assertIn("5% of the quota kept free", str(e.exception))
+        self.assertEqual(self.calls, ["gone"])
+
+    def test_room_enough_touches_nothing(self):
+        self.used = 200 * self.GB
+        self.preflight()
+        self.assertEqual(self.calls, [])
+
+    def test_pressure_runs_the_housekeeping_once_an_hour(self):
+        ran = []
+        mcu.storage_housekeeping = ran.append
+        usage = {"full": {"media": {"hdd": {"used": 280, "quota": 300}}},
+                 "fine": {"media": {"hdd": {"used": 100, "quota": 300}}}, "_pools": {}}
+        (mcu.STATE / "usage.json").write_text(json.dumps(usage))
+        mcu.pressure()
+        mcu.pressure()
+        self.assertEqual(ran, ["full"])
+        old = time.time() - 2 * 3600
+        os.utime(mcu.STATE / "pressure" / "full", (old, old))
+        mcu.pressure()
+        self.assertEqual(ran, ["full", "full"])
+
+
 if __name__ == "__main__":
     unittest.main()

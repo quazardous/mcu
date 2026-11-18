@@ -59,4 +59,3 @@ def set_burst_w(watts, root="/"):
     if name is None or not name.exists() or name.read_text().strip() != "short_term":
         raise OSError("this CPU has no RAPL short-term power limit to set")
     (z / "constraint_1_power_limit_uw").write_text(str(int(watts * 1e6)))
-

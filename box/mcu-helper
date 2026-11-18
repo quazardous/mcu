@@ -1391,8 +1391,13 @@ def save_power(st):
 
 
 def power_write(watts):
+    """PL1 to these watts, and PL2 to box.toml [power] burst when set (never
+    under PL1: a burst limit below the sustained one would lower both)"""
     try:
         rapl.set_limit_w(watts)
+        burst = box_conf().get("power", {}).get("burst")
+        if burst:
+            rapl.set_burst_w(max(float(burst), watts))
     except (ValueError, OSError) as e:
         die(str(e))
 

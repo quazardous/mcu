@@ -116,6 +116,22 @@ class Power(unittest.TestCase):
         with self.assertRaises(ValueError):
             rapl.set_limit_w(500, root)
 
+    def test_burst_read_and_write(self):
+        z = "/sys/class/powercap/intel-rapl:0/"
+        root = tree({z + "energy_uj": "1\n", z + "constraint_0_power_limit_uw": "20000000\n",
+                     z + "constraint_1_name": "short_term\n", z + "constraint_1_power_limit_uw": "64000000\n"})
+        self.assertEqual(rapl.burst_w(root), 64.0)
+        rapl.set_burst_w(35, root)
+        self.assertEqual(rapl.burst_w(root), 35.0)
+        with self.assertRaises(ValueError):
+            rapl.set_burst_w(1, root)
+        # a zone whose second constraint is not the short-term one: not touched
+        other = tree({z + "energy_uj": "1\n", z + "constraint_0_power_limit_uw": "20000000\n",
+                      z + "constraint_1_name": "peak_power\n", z + "constraint_1_power_limit_uw": "90000000\n"})
+        with self.assertRaises(OSError):
+            rapl.set_burst_w(35, other)
+        self.assertIsNone(rapl.burst_w(NONE))
+
     def test_amd_zone_and_none(self):
         amd = tree({"/sys/class/powercap/amd-rapl:0/energy_uj": "1\n",
                     "/sys/class/powercap/amd-rapl:0/constraint_0_power_limit_uw": "65000000\n"})

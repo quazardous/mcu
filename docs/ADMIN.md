@@ -112,6 +112,18 @@ runs timing jobs uncapped, with a cool-down only.
 mcu-admin power fast | balanced | quiet
 ```
 
+The short-term limit (PL2), how far each burst may go for a few seconds, is
+the firmware's unless `/etc/mcu/box.toml` sets it. On a laptop CPU in a small
+case, the firmware's (64 W on a 15 W part) takes the CPU to its maximum
+temperature within seconds at every job's start, and it throttles:
+
+```toml
+[power]
+burst = 35      # watts; never below the profile's own (it is raised to it)
+```
+
+It applies with the next profile change, at boot, and after each timing job.
+
 ## The eGPU
 
 On a box with an NVIDIA GPU behind Thunderbolt, eject it before unplugging:

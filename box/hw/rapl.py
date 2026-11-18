@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""RAPL: the CPU package's energy counter (the power graph) and its long-term
-limit (the power profiles). Intel, and recent AMD through the same powercap
+"""RAPL: the CPU package's energy counter (the power graph), its long-term
+limit (the power profiles) and its short-term one (box.toml [power] burst). Intel, and recent AMD through the same powercap
 interface."""
 
 from ._sys import path
@@ -39,4 +39,24 @@ def set_limit_w(watts, root="/"):
     if z is None or not (z / "constraint_0_power_limit_uw").exists():
         raise OSError("this CPU has no RAPL power limit to set")
     (z / "constraint_0_power_limit_uw").write_text(str(int(watts * 1e6)))
+
+
+def burst_w(root="/"):
+    """the short-term power limit (PL2) in watts, or None without one"""
+    z = zone(root)
+    f = z / "constraint_1_power_limit_uw" if z else None
+    return int(f.read_text()) / 1e6 if f and f.exists() else None
+
+
+def set_burst_w(watts, root="/"):
+    """PL2 in watts: how far a burst may go above PL1 for a few seconds. On
+    a small case, the firmware's PL2 (64 W on a 15 W U-series) reaches the
+    CPU's maximum temperature within seconds at each job's start"""
+    if not 3 <= watts <= 200:
+        raise ValueError(f"{watts:g} W is not a sensible CPU power limit")
+    z = zone(root)
+    name = z / "constraint_1_name" if z else None
+    if name is None or not name.exists() or name.read_text().strip() != "short_term":
+        raise OSError("this CPU has no RAPL short-term power limit to set")
+    (z / "constraint_1_power_limit_uw").write_text(str(int(watts * 1e6)))
 

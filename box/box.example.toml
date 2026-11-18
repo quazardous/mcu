@@ -82,3 +82,12 @@
 # probe = "nvidia"
 # share = "exclusive"
 # provides = ["cuda", "vulkan", "opencl", "opengl"]
+
+# the CPU's power: the profiles' long-term limits (PL1, watts; by default
+# from the firmware's: fast = it, balanced 2/3, quiet 1/2), and the
+# short-term one (PL2) for the bursts, the firmware's when unset
+# [power]
+# fast = 30
+# balanced = 20
+# quiet = 15
+# burst = 35

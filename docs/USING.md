@@ -931,9 +931,16 @@ The box is a shared machine with an external GPU: it can be off, in
 maintenance, or without its GPU. You always get a clear answer, never a hang:
 
 ```sh
-box          # first line: ok | degraded: gpu absent | maintenance: <reason>
-             # then the details as JSON (threads, memory, gpu, gpu_state, queue)
+box          # first line: ok | degraded: <problems> | maintenance: <reason>
+             # then the details as JSON (threads, memory, gpu, gpu_state, queue,
+             # problems, notes)
 ```
+
+`degraded` means a fault, something to repair: the GPU `lost` (pulled
+without an eject, or the driver cannot take it back), or the box's monitor
+stale. A GPU that is unplugged, switched off or ejected by the admin is not
+a fault: the box stays `ok`, with `gpu: false` and `notes: ["no gpu
+(absent)"]`. GPU jobs are refused as below; other jobs run normally.
 
 **Exit 75** (EX_TEMPFAIL) from `run`, `provision`, `wait` or `debug` means
 the box could not serve the job. Retry later or run it elsewhere; never
@@ -1068,7 +1075,7 @@ a paused queue.
 
 `mcu-job health` prints one JSON document:
 
-- `status`: ok, degraded or maintenance;
+- `status`: ok, degraded (a fault: the GPU lost) or maintenance; a GPU that is only unplugged or ejected leaves it ok, as `gpu` shows;
 - `queue`: its `mode` (open, paused, closed) and `reason`; the `capacity`
   (threads and memory for jobs); every project's `running` jobs (threads,
   exclusive, started, `eta_end`) and `waiting` ones (why, `position`,

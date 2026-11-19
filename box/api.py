@@ -227,10 +227,9 @@ def resources():
     problems = []
     if time.time() - res.get("updated", 0) > 180:
         problems.append("box monitor stale")
-    if res.get("gpu") is False:
-        problems.append(f"gpu {res.get('gpu_state') or 'absent'}" + (" by the admin" if res.get("gpu_state") in ("ejecting", "ejected", "attaching")
-                                                                       else f" ({res['gpu_note']})" if res.get("gpu_note") else ""))
-    res["problems"] = problems
+    faults, notes = mcuconf.gpu_status(res.get("gpu") is not False, res.get("gpu_state"), res.get("gpu_note"))
+    res["problems"] = problems + faults
+    res["notes"] = notes
     res["status"] = "maintenance" if res["maintenance"] else ("degraded" if problems else "ok")
     return res
 

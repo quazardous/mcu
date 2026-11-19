@@ -50,7 +50,7 @@ to where the docs explain it.
 - **Results without copying.** Fetch them, or read them in place over a
   read-only sshfs view of the job's directory and storage
   ([reading in place](docs/USING.md#reading-in-place-the-projects-view)).
-- **`health`** gives the box as an agent sees it: whether it is degraded, the
+- **`health`** gives the box as an agent sees it: whether it is degraded (a fault) or missing its GPU, the
   queue, and what to do ([health](docs/USING.md#health-the-box-as-an-agent-sees-it)).
 
 ### Builds that stay warm

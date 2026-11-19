@@ -140,6 +140,9 @@
       {/if}
     </div>
   {/if}
+  {#if res.status === "ok" && res.notes?.length}
+    <div class="banner maint"><b>No GPU:</b> {res.notes.join(", ")}. GPU jobs are refused (exit 75); other jobs run normally.</div>
+  {/if}
   <main class="page" class:wide={page === "" || page === "home" || page === "jobs"}>
     {#if page === "p" && route.parts[2] === "jobs" && route.parts[3]}
       <Job project={route.parts[1]} job={route.parts[3]} />

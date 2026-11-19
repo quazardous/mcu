@@ -1047,7 +1047,7 @@ def queue_state(project, sched, events):
 def health(project):
     """everything an agent may want to know before or after a run"""
     out = {
-        "status": ("maintenance" if maintenance() else "degraded" if read_state_json("resources.json").get("gpu") is False else "ok"),
+        "status": ("maintenance" if maintenance() else "degraded" if gpu_flag().get("state") == "lost" and not gpu_present() else "ok"),
         "queue": queue_state(project, read_state_json("state.json"), recent_events()),
         "machine": machine_now(),
         "gpu": gpu_now(),
@@ -4830,16 +4830,15 @@ def box_status():
     gpu = not ejected and gpu_present()
     flag = gpu_flag()
     gpu_state = ejected or ("present" if gpu else "lost" if flag.get("state") == "lost" else "absent")
-    if not gpu:
-        problems.append(f"gpu {gpu_state}" + (" by the admin" if ejected else
-                                              f" ({flag.get('note')})" if gpu_state == "lost" and flag.get("note") else ""))
+    faults, notes = mcuconf.gpu_status(gpu, gpu_state, flag.get("note"))
+    problems += faults
     status = (f"maintenance: {reason}{until_text(queue_flag())}" if reason
               else ("degraded: " + ", ".join(problems) if problems else "ok"))
     mode = queue_mode()
     print(status + (f" (queue paused: {hold()})" if mode == "paused" else ""))
     print(json.dumps({
         "status": "maintenance" if reason else ("degraded" if problems else "ok"),
-        "maintenance": reason, "queue": mode, "hold": hold(), "problems": problems, "gpu": gpu,
+        "maintenance": reason, "queue": mode, "hold": hold(), "problems": problems, "notes": notes, "gpu": gpu,
         "maintenance_until": queue_flag().get("until") if reason else None,
         "view": view_line(project_name()),
         "version": mcuconf.version(),

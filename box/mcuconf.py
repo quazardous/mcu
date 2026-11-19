@@ -36,6 +36,20 @@ def version():
     return "unknown"
 
 
+ADMIN_GPU = ("ejecting", "ejected", "attaching")
+
+
+def gpu_status(gpu, state, note=None):
+    """(problems, notes) for the box's status: a lost GPU is a fault (degraded:
+    a reboot or a replug to do); one unplugged, off or ejected by the admin is
+    only missing, the box is fine without it (ok, with a note)"""
+    if gpu:
+        return [], []
+    if state == "lost":
+        return ["gpu lost" + (f" ({note})" if note else "")], []
+    return [], [f"no gpu ({state or 'absent'}" + (" by the admin)" if state in ADMIN_GPU else ")")]
+
+
 def _mem_total():
     try:
         with open("/proc/meminfo") as f:

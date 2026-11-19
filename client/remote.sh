@@ -50,8 +50,8 @@ if [ "${1:-}" = --check ]; then
   rc=$?
   [ $rc -eq 255 ] && unreachable
   echo "$out"
-  # ok: 0; degraded or maintenance: 75, with the details printed
-  head -1 <<< "$out" | grep -qx ok && exit 0 || exit 75
+  # ok (with or without its GPU): 0; degraded or maintenance: 75, with the details printed
+  head -1 <<< "$out" | grep -qE '^ok($|[: ])' && exit 0 || exit 75
 fi
 
 if [ "${1:-}" = --benchfile ]; then

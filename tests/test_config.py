@@ -244,3 +244,42 @@ class TrackerRefs(unittest.TestCase):
         self.assertTrue(ref.search("(see " + h + "3992)"))
         self.assertFalse(ref.search('stroke: "#888"'))
         self.assertFalse(ref.search("anchor #top"))
+
+
+class GpuStatus(unittest.TestCase):
+    """a lost GPU is a fault (degraded); one unplugged, off or ejected only
+    a note, the box stays ok"""
+
+    def test_present(self):
+        self.assertEqual(mcuconf.gpu_status(True, "present"), ([], []))
+
+    def test_unplugged_or_ejected_is_a_note(self):
+        self.assertEqual(mcuconf.gpu_status(False, "absent"), ([], ["no gpu (absent)"]))
+        self.assertEqual(mcuconf.gpu_status(False, None), ([], ["no gpu (absent)"]))
+        self.assertEqual(mcuconf.gpu_status(False, "ejected"), ([], ["no gpu (ejected by the admin)"]))
+
+    def test_lost_is_a_fault(self):
+        self.assertEqual(mcuconf.gpu_status(False, "lost", "reboot the box"),
+                         (["gpu lost (reboot the box)"], []))
+
+
+class RemoteCheck(unittest.TestCase):
+    """remote.sh --check: 0 when the box's first line is ok, 75 otherwise"""
+
+    def check(self, first):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "ssh"
+            fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{first}' '{{}}'\n")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", MCU_HOST="u@box")
+            env.pop("MCU_KEY", None)
+            return subprocess.run([str(BOX.parent / "client" / "remote.sh"), "--check"], env=env,
+                                  capture_output=True, text=True).returncode
+
+    def test_ok_passes_degraded_does_not(self):
+        self.assertEqual(self.check("ok"), 0)
+        self.assertEqual(self.check("ok: no gpu (absent)"), 0)
+        self.assertEqual(self.check("okay"), 75)
+        self.assertEqual(self.check("degraded: gpu lost"), 75)
+        self.assertEqual(self.check("maintenance: disk swap"), 75)
